@@ -167,7 +167,7 @@ def page_daily(館):
         st.session_state.routes = routes
         st.session_state.target_date = target_date
         st.session_state.staff_on_duty = staff_on_duty
-        st.session_state.館 = 館
+        st.session_state["selected_kan"] = 館
         st.success("✅ ルートを生成しました！下にスクロールして確認・修正してください。")
 
     # ── ルート確認・修正 ──
