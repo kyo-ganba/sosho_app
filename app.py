@@ -239,24 +239,48 @@ def page_master(館):
             st.dataframe(raw_df.head(), use_container_width=True)
 
             st.subheader("列マッピング設定")
-            st.caption("リタリコCSVの列名 → アプリ内の項目に対応付けてください")
+
             cols_in_csv = ["（未選択）"] + list(raw_df.columns)
-            c1, c2, c3 = st.columns(3)
-            col_name   = c1.selectbox("氏名列",         cols_in_csv, key="m_name")
-            col_kana   = c2.selectbox("フリガナ列",      cols_in_csv, key="m_kana")
-            col_addr   = c3.selectbox("住所列",          cols_in_csv, key="m_addr")
-            c4, c5, c6 = st.columns(3)
-            col_school = c4.selectbox("学校名列",        cols_in_csv, key="m_school")
-            col_type   = c5.selectbox("区分列(放デイ/児発)", cols_in_csv, key="m_type")
-            col_day    = c6.selectbox("利用曜日列",      cols_in_csv, key="m_day")
+
+            # 自動推定: リタリコの典型的な列名を候補にする
+            def _guess(candidates):
+                for c in candidates:
+                    if c in raw_df.columns:
+                        return c
+                return "（未選択）"
+
+            st.caption("氏名・住所は自動推定しています。必要に応じて変更してください。")
+            c1, c2 = st.columns(2)
+            col_name = c1.selectbox("氏名列（必須）", cols_in_csv,
+                index=cols_in_csv.index(_guess(["児童","氏名","利用者名","お子様名"])),
+                key="m_name")
+            col_kana = c2.selectbox("フリガナ列", cols_in_csv,
+                index=cols_in_csv.index(_guess(["児童カナ","フリガナ","保護者（カナ）"])),
+                key="m_kana")
+
+            st.caption("住所：「市区町村」＋「番地」など複数列がある場合は自動結合します。単一列の場合はここで選択。")
+            col_addr = st.selectbox("住所列（単一列の場合のみ選択）", cols_in_csv,
+                index=0, key="m_addr")
+
+            st.caption("以下は列がない場合は空欄のままで取込後に手動入力できます。")
+            c3, c4, c5 = st.columns(3)
+            col_school = c3.selectbox("学校・迎え先列", cols_in_csv,
+                index=cols_in_csv.index(_guess(["学校名","学校","通学先","迎え先"])),
+                key="m_school")
+            col_type = c4.selectbox("区分列（放デイ/児発）", cols_in_csv,
+                index=cols_in_csv.index(_guess(["サービス種別","区分","サービス"])),
+                key="m_type")
+            col_day = c5.selectbox("利用曜日列", cols_in_csv,
+                index=cols_in_csv.index(_guess(["利用曜日","曜日"])),
+                key="m_day")
 
             if st.button("取込・保存", type="primary"):
                 mapping = {"氏名": col_name, "フリガナ": col_kana, "住所": col_addr,
-                           "学校名": col_school, "区分": col_type, "利用曜日": col_day}
+                           "迎え先": col_school, "区分": col_type, "利用曜日": col_day}
                 result_df = import_from_ritalico(raw_df, mapping)
                 save_master(館, result_df)
-                st.success(f"{len(result_df)}件を取り込みました。")
-                st.dataframe(result_df, use_container_width=True)
+                st.success(f"{len(result_df)}件を取り込みました！取込後、下の「手動編集」タブで下校時刻・区分を確認・入力してください。")
+                st.dataframe(result_df[["氏名","地区","住所","迎え先","区分","利用曜日"]], use_container_width=True)
 
     with tab_edit:
         st.subheader("利用者一覧・編集")
