@@ -223,7 +223,18 @@ def page_master(館):
                 "氏名・住所・学校名などを自動マッピングします。")
         uploaded = st.file_uploader("CSVファイルを選択", type=["csv"], key="ritalico_csv")
         if uploaded:
-            raw_df = pd.read_csv(uploaded, encoding="utf-8-sig")
+            raw_bytes = uploaded.read()
+            raw_df = None
+            for enc in ["utf-8-sig", "shift-jis", "cp932", "utf-8"]:
+                try:
+                    import io as _io
+                    raw_df = pd.read_csv(_io.BytesIO(raw_bytes), encoding=enc)
+                    break
+                except Exception:
+                    continue
+            if raw_df is None:
+                st.error("CSVの文字コードを判定できませんでした。UTF-8またはShift-JISで保存し直してください。")
+                st.stop()
             st.write("**CSVプレビュー（先頭5行）**")
             st.dataframe(raw_df.head(), use_container_width=True)
 
