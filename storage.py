@@ -1,8 +1,15 @@
 """
-データ永続化モジュール — Google Sheets + ローカルファイル二重保存
+データ永続化モジュール — Supabase + ローカルファイル二重保存
 
-Google Sheets設定済み（st.secrets["gsheet"]）→ Sheets優先 + ローカルバックアップ
+Supabase設定済み（st.secrets["supabase"]）→ Supabase優先 + ローカルバックアップ
 未設定 → ローカルのみ（Streamlit無料プランでは再起動時にリセットされる）
+
+Supabaseに事前作成が必要なテーブル（SQL）:
+  CREATE TABLE app_data (
+    key TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now()
+  );
 """
 import json
 import pandas as pd
@@ -13,68 +20,81 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 
-# ── Streamlit / gspread 依存を安全にインポート ──────────────────
+# ── Streamlit / supabase 依存を安全にインポート ──────────────────
 try:
     import streamlit as st
 
     @st.cache_resource(show_spinner=False)
-    def _gsheet_resource():
+    def _supabase_client():
         """
-        gspreadクライアント と spreadsheet_id を返す（アプリ全体で1回だけ接続）。
-        st.secrets["gsheet"] が未設定の場合は (None, None) を返す。
+        Supabaseクライアントを返す（アプリ全体で1回だけ接続）。
+        st.secrets["supabase"] が未設定の場合は None を返す。
         """
         try:
-            import gspread
-            if "gsheet" not in st.secrets:
-                return None, None
-            cfg = dict(st.secrets["gsheet"])
-            sid = cfg.pop("spreadsheet_id", None)
-            if not sid:
-                return None, None
-            gc = gspread.service_account_from_dict(cfg)
-            return gc, sid
+            from supabase import create_client
+            if "supabase" not in st.secrets:
+                return None
+            url = st.secrets["supabase"]["url"]
+            key = st.secrets["supabase"]["key"]
+            return create_client(url, key)
         except Exception:
-            return None, None
+            return None
 
 except Exception:
     # Streamlit 以外の環境（テスト等）では常にローカルモード
-    def _gsheet_resource():  # type: ignore
-        return None, None
-
-
-def _open_spreadsheet():
-    """Spreadsheet オブジェクトを返す。未設定・エラー時は None。"""
-    gc, sid = _gsheet_resource()
-    if gc is None:
-        return None
-    try:
-        return gc.open_by_key(sid)
-    except Exception:
+    def _supabase_client():  # type: ignore
         return None
 
 
-def is_gsheet_configured() -> bool:
-    """Google Sheets 連携が有効かどうか"""
+def is_supabase_configured() -> bool:
+    """Supabase 連携が有効かどうか"""
     try:
         import streamlit as st
-        return "gsheet" in st.secrets
+        return "supabase" in st.secrets
     except Exception:
         return False
+
+# app.py の既存インポートとの後方互換性
+def is_gsheet_configured() -> bool:
+    return is_supabase_configured()
+
+
+def _sb_get(key: str):
+    """Supabase から key に対応する data を取得。なければ None。"""
+    client = _supabase_client()
+    if not client:
+        return None
+    try:
+        res = client.table("app_data").select("data").eq("key", key).execute()
+        if res.data:
+            return res.data[0]["data"]
+        return None
+    except Exception:
+        return None
+
+
+def _sb_set(key: str, data):
+    """Supabase に key と data を upsert。"""
+    client = _supabase_client()
+    if not client:
+        return
+    try:
+        client.table("app_data").upsert({"key": key, "data": data}).execute()
+    except Exception:
+        pass
 
 
 # ── DataFrame I/O ─────────────────────────────────────────────
 def load_df(館: str, name: str, columns: list = None) -> pd.DataFrame:
     """
     DataFrame を読み込む。
-    Sheets 設定済み → Google Sheets から読む（ローカルにフォールバック）
+    Supabase 設定済み → Supabase から読む（ローカルにフォールバック）
     未設定     → ローカル CSV から読む
     """
-    sh = _open_spreadsheet()
-    if sh:
+    raw = _sb_get(f"{館}_{name}")
+    if raw is not None:
         try:
-            ws = sh.worksheet(f"{館}_{name}")
-            records = ws.get_all_records(default_blank="")
-            df = pd.DataFrame(records).fillna("").astype(str)
+            df = pd.DataFrame(raw).fillna("").astype(str)
             if columns:
                 for c in columns:
                     if c not in df.columns:
@@ -99,46 +119,25 @@ def load_df(館: str, name: str, columns: list = None) -> pd.DataFrame:
 
 def save_df(館: str, name: str, df: pd.DataFrame):
     """
-    DataFrame を保存する（ローカル CSV に常に保存 + Sheets が設定済みなら Sheets にも）。
+    DataFrame を保存する（ローカル CSV に常に保存 + Supabase が設定済みなら Supabase にも保存）。
     """
     # 常にローカルに保存
     p = DATA_DIR / f"{館}_{name}.csv"
     df.to_csv(p, index=False, encoding="utf-8-sig")
 
-    # Sheets にも保存
-    sh = _open_spreadsheet()
-    if sh:
-        try:
-            ws_name = f"{館}_{name}"
-            try:
-                ws = sh.worksheet(ws_name)
-                ws.clear()
-            except Exception:
-                ws = sh.add_worksheet(
-                    title=ws_name,
-                    rows=max(len(df) + 10, 50),
-                    cols=max(len(df.columns) + 2, 5),
-                )
-            data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-            ws.update(data)
-        except Exception:
-            pass  # ローカル保存は成功しているので無視
+    # Supabase にも保存
+    records = df.fillna("").astype(str).to_dict("records")
+    _sb_set(f"{館}_{name}", records)
 
 
 # ── JSON I/O ──────────────────────────────────────────────────
 def load_json_data(館: str, name: str, default=None):
     """
-    JSON データを読み込む（Sheets → ローカル JSON の順）。
+    JSON データを読み込む（Supabase → ローカル JSON の順）。
     """
-    sh = _open_spreadsheet()
-    if sh:
-        try:
-            ws = sh.worksheet(f"{館}_{name}_json")
-            raw = ws.acell("A1").value
-            if raw:
-                return json.loads(raw)
-        except Exception:
-            pass
+    raw = _sb_get(f"{館}_{name}_json")
+    if raw is not None:
+        return raw
 
     p = DATA_DIR / f"{館}_{name}.json"
     if p.exists():
@@ -148,24 +147,14 @@ def load_json_data(館: str, name: str, default=None):
 
 def save_json_data(館: str, name: str, data):
     """
-    JSON データを保存する（ローカル + Sheets）。
+    JSON データを保存する（ローカル + Supabase）。
     """
     # ローカルに常に保存
     p = DATA_DIR / f"{館}_{name}.json"
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Sheets にも保存
-    sh = _open_spreadsheet()
-    if sh:
-        try:
-            ws_name = f"{館}_{name}_json"
-            try:
-                ws = sh.worksheet(ws_name)
-            except Exception:
-                ws = sh.add_worksheet(title=ws_name, rows=5, cols=2)
-            ws.update("A1", [[json.dumps(data, ensure_ascii=False)]])
-        except Exception:
-            pass
+    # Supabase にも保存
+    _sb_set(f"{館}_{name}_json", data)
 
 
 # ── 変更履歴（ローカルのみ） ─────────────────────────────────
