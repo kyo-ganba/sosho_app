@@ -1,10 +1,8 @@
 """
-送迎表作成ツール v0.6
-- 送迎先（平日/長期休み）分離
-- 利用者マスタ CRUD + 変更履歴
-- 曜日チェックボックスUI
-- 使い方ガイド（折りたたみ）
-- セルサイズ統一済みExcel出力
+送迎表作成ツール v0.7
+- 運転者を便・車両ごとに手動設定できるUI
+- Google Sheets永続化（storage.py経由）
+- データ保存状態をサイドバーに表示
 """
 import streamlit as st
 import pandas as pd
@@ -18,6 +16,7 @@ from master import (load_master, save_master, import_from_ritalico,
                     load_history_list, load_history, MASTER_COLUMNS)
 from routing import generate_routes
 from excel_export import export_schedule
+from storage import load_json_data, save_json_data, is_gsheet_configured
 
 st.set_page_config(page_title="送迎表ツール", page_icon="🚐", layout="wide")
 
@@ -39,36 +38,31 @@ def _str_to_time(s, default="15:00"):
             return time(15, 0)
 
 def load_vehicles(館):
-    p = DATA_DIR / f"{館}_vehicles.json"
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return [{"車両名":"セレナ","定員":7},{"車両名":"ボクシー","定員":7},
-            {"車両名":"白フリード","定員":6},{"車両名":"銀フリ地下","定員":6},
-            {"車両名":"銀フリ浅香","定員":6}]
+    return load_json_data(館, "vehicles", default=[
+        {"車両名":"セレナ","定員":7},{"車両名":"ボクシー","定員":7},
+        {"車両名":"白フリード","定員":6},{"車両名":"銀フリ地下","定員":6},
+        {"車両名":"銀フリ浅香","定員":6}])
 
 def save_vehicles(館, data):
-    (DATA_DIR / f"{館}_vehicles.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_json_data(館, "vehicles", data)
 
 def load_staff(館):
-    p = DATA_DIR / f"{館}_staff.json"
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+    return load_json_data(館, "staff", default=[])
 
 def save_staff(館, data):
-    (DATA_DIR / f"{館}_staff.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_json_data(館, "staff", data)
 
 # ════ ページ: 当日入力 ════════════════════════════════════════
 def page_daily(館):
-    # ── 使い方ガイド ──
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
-**【STEP 1】** 対象日を選ぶ → 曜日が自動表示されます  
-**【STEP 2】** 参加者チェック — その曜日の固定利用者に自動でチェックが入ります。欠席者はチェックを外し、追加参加者はチェックを入れてください  
-**【STEP 3】** 迎え時刻を確認・修正 — 当日の下校時刻が変わる場合はここで変更します  
-**【STEP 4】** 本日のスタッフ勤務状況を確認・修正  
-**【STEP 5】**「送迎ルートを自動生成」ボタンを押す  
-**【STEP 6】** 生成されたルートを確認・手修正し「Excelをダウンロード」
+**【STEP 1】** 対象日を選ぶ → 曜日が自動表示されます
+**【STEP 2】** 参加者チェック — その曜日の固定利用者に自動でチェックが入ります。欠席者はチェックを外し、追加参加者はチェックを入れてください
+**【STEP 3】** 迎え時刻を確認・修正 — 当日の下校時刻が変わる場合はここで変更します
+**【STEP 4】** 本日のスタッフ勤務状況を確認・修正
+**【STEP 5】**「送迎ルートを自動生成」ボタンを押す
+**【STEP 6】** 生成されたルートを確認・修正（車両ごとのドライバー設定も可能）
+**【STEP 7】** 「Excelをダウンロード」
         """)
 
     st.header(f"📅 当日入力 — {館}")
@@ -104,7 +98,6 @@ def page_daily(館):
         st.divider()
 
         for idx, row in master_df.iterrows():
-            # 曜日チェック
             rdays = str(row.get("利用曜日",""))
             default_attend = wday in rdays if rdays else False
 
@@ -158,7 +151,6 @@ def page_daily(館):
         if parts.empty:
             st.error("参加者が選択されていません")
             return
-        # 時刻上書き
         time_col = "迎え時刻（長期休み）" if is_long else "迎え時刻（平日）"
         for orig_idx, t_str in time_overrides.items():
             if orig_idx in parts.index:
@@ -177,18 +169,42 @@ def page_daily(館):
         st.divider()
         st.subheader("🗺️ 生成ルート（確認・修正）")
         routes = st.session_state.routes
-        edited = {}
 
+        # 運転可能なスタッフ一覧
+        sod = st.session_state.get("staff_on_duty", {})
+        drivers_on_duty = [n for n, i in sod.items() if i.get("drive")]
+
+        edited = {}
         for vehicle, trips in routes.items():
             with st.container(border=True):
-                st.markdown(f"#### 🚐 {vehicle}")
+                col_vh, col_drv = st.columns([3, 2])
+                col_vh.markdown(f"#### 🚐 {vehicle}")
+
+                # 車両ごとのデフォルトドライバー（全便一括設定）
+                drv_opts = ["（便ごとに設定）"] + drivers_on_duty
+                veh_driver = col_drv.selectbox(
+                    "担当ドライバー（全便に一括適用）",
+                    drv_opts,
+                    key=f"veh_drv_{vehicle}",
+                )
+
+                # 一括適用の場合は全tripsのdriverを上書き
+                effective_trips = []
+                for t in trips:
+                    t2 = dict(t)
+                    if veh_driver != "（便ごとに設定）":
+                        t2["driver"] = veh_driver
+                    effective_trips.append(t2)
+
                 tab_m, tab_o = st.tabs(["迎え", "送り"])
                 with tab_m:
                     edited.setdefault(vehicle, {})["迎え"] = _trip_editor(
-                        [t for t in trips if t["type"]=="迎え"], vehicle, "迎え")
+                        [t for t in effective_trips if t["type"]=="迎え"],
+                        vehicle, "迎え", drivers=drivers_on_duty)
                 with tab_o:
                     edited.setdefault(vehicle, {})["送り"] = _trip_editor(
-                        [t for t in trips if t["type"]=="送り"], vehicle, "送り")
+                        [t for t in effective_trips if t["type"]=="送り"],
+                        vehicle, "送り", drivers=drivers_on_duty)
 
         st.divider()
         td = st.session_state.target_date
@@ -210,25 +226,37 @@ def page_daily(館):
                 st.session_state.routes = None; st.rerun()
 
 
-def _trip_editor(trips, vehicle, trip_type):
+def _trip_editor(trips, vehicle, trip_type, drivers=None):
+    """便リストの編集UI。drivers が指定されている場合はドライバーをselectboxで選択。"""
     if not trips:
         st.caption("（なし）")
         return []
     edited = []
+    driver_opts = [""] + (drivers or [])
     for i, trip in enumerate(trips):
-        c1,c2,c3,c4 = st.columns([0.15,0.25,0.3,0.3])
+        c1, c2, c3, c4 = st.columns([0.15, 0.25, 0.3, 0.3])
         t = c1.time_input("", value=_str_to_time(trip.get("time","15:00")),
                           key=f"{vehicle}_{trip_type}_{i}_t", step=300,
                           label_visibility="collapsed")
-        name   = c2.text_input("", value=trip.get("name",""),
-                                key=f"{vehicle}_{trip_type}_{i}_n",
-                                label_visibility="collapsed")
-        place  = c3.text_input("", value=trip.get("place",""),
-                                key=f"{vehicle}_{trip_type}_{i}_p",
-                                label_visibility="collapsed")
-        driver = c4.text_input("", value=trip.get("driver",""),
-                                key=f"{vehicle}_{trip_type}_{i}_d",
-                                label_visibility="collapsed")
+        name  = c2.text_input("", value=trip.get("name",""),
+                               key=f"{vehicle}_{trip_type}_{i}_n",
+                               label_visibility="collapsed")
+        place = c3.text_input("", value=trip.get("place",""),
+                               key=f"{vehicle}_{trip_type}_{i}_p",
+                               label_visibility="collapsed")
+        cur_drv = trip.get("driver", "")
+        if drivers:
+            try:
+                drv_idx = driver_opts.index(cur_drv)
+            except ValueError:
+                drv_idx = 0
+            driver = c4.selectbox("", options=driver_opts, index=drv_idx,
+                                   key=f"{vehicle}_{trip_type}_{i}_d",
+                                   label_visibility="collapsed")
+        else:
+            driver = c4.text_input("", value=cur_drv,
+                                    key=f"{vehicle}_{trip_type}_{i}_d",
+                                    label_visibility="collapsed")
         edited.append({"type":trip_type,"time":str(t)[:5],"name":name,
                         "place":place,"driver":driver})
     return edited
@@ -236,31 +264,30 @@ def _trip_editor(trips, vehicle, trip_type):
 
 # ════ ページ: 利用者マスタ ════════════════════════════════════
 def page_master(館):
-    # ── 使い方ガイド ──
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
-**【利用者の追加】**「手動編集」タブ → 表の一番下の行に入力 →「保存」ボタン  
-**【利用者の削除】**「手動編集」タブ → 削除したい行の左端のチェックボックスを選択 → ゴミ箱アイコン →「保存」ボタン  
-**【一括取込】**「リタリコCSV取込」タブ → CSVをアップロード → 列マッピングを確認 →「取込・保存」  
-**【変更履歴】**「変更履歴」タブ → 過去の状態に戻すことができます  
+**【利用者の追加】**「手動編集」タブ → 表の一番下の行に入力 →「保存」ボタン
+**【利用者の削除】**「手動編集」タブ → 削除したい行の左端のチェックボックスを選択 → ゴミ箱アイコン →「保存」ボタン
+**【一括取込】**「リタリコCSV取込」タブ → CSVをアップロード → 列マッピングを確認 →「取込・保存」
+**【変更履歴】**「変更履歴」タブ → 過去の状態に戻すことができます
 
-⚠️ **迎え先（平日）**: 通常の下校先（学校名など）  
-⚠️ **迎え先（長期休み）**: 夏休み等は自宅になる場合が多いです  
-⚠️ **利用曜日**: `月水金` のように続けて入力（スペースなし）
+⚠️ **迎え先（平日）**: 通常の下校先（学校名など）
+⚠️ **迎え先（長期休み）**: 夏休み等は自宅になる場合が多いです
+⚠️ **利用曜日**: 月水金 のように続けて入力（スペースなし）
         """)
 
     st.header(f"👥 利用者マスタ管理 — {館}")
+    if is_gsheet_configured():
+        st.info("☁️ Google Sheetsに自動バックアップされています", icon="✅")
+
     tab_edit, tab_import, tab_hist = st.tabs(["✏️ 手動編集", "📂 リタリコCSV取込", "🕐 変更履歴"])
 
-    # ── 手動編集 ──
     with tab_edit:
         master_df = load_master(館)
         if master_df.empty:
             master_df = pd.DataFrame(columns=MASTER_COLUMNS)
 
         st.caption(f"登録人数: {len(master_df)}名")
-
-        # 曜日チェックボックスUI: 利用曜日列のヘルプ表示
         st.info("💡 利用曜日は「月水金」のように漢字1文字で続けて入力してください。当日入力画面でその曜日の利用者に自動チェックが入ります。")
 
         edited = st.data_editor(
@@ -285,7 +312,6 @@ def page_master(館):
                 st.success(f"✅ {len(edited)}件を保存しました")
                 st.rerun()
 
-    # ── CSV取込 ──
     with tab_import:
         st.subheader("リタリコCSVをインポート")
         st.info("リタリコから「保護者一覧」などのCSVをエクスポートしてアップロードしてください。")
@@ -345,7 +371,6 @@ def page_master(館):
                 st.dataframe(result_df[["氏名","地区","迎え先（平日）","区分","利用曜日"]],
                              use_container_width=True)
 
-    # ── 変更履歴 ──
     with tab_hist:
         st.subheader("変更履歴")
         hist_list = load_history_list(館)
@@ -366,9 +391,9 @@ def page_master(館):
 def page_vehicles(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
-**【車両の追加・変更】**「車両」タブ → 表に入力 →「保存」ボタン  
-**【スタッフの追加】**「スタッフ」タブ → 氏名・運転可否・勤務時間を入力 →「保存」ボタン  
-⚠️「運転可」にチェックがあるスタッフのみ、当日入力画面で運転者候補として表示されます
+**【車両の追加・変更】**「車両」タブ → 表に入力 →「保存」ボタン
+**【スタッフの追加】**「スタッフ」タブ → 氏名・運転可否・勤務時間を入力 →「保存」ボタン
+"��️「運転可」にチェックがあるスタッフのみ、当日入力画面で運転者候補として表示されます
         """)
 
     st.header(f"🚗 車両・スタッフ設定 — {館}")
@@ -390,14 +415,12 @@ def page_vehicles(館):
             save_staff(館, es.to_dict("records")); st.success("✅ 保存しました")
 
 
-
-
 # ════ ページ: カラー設定 ═══════════════════════════════════
 def page_colors(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
-**色の変更方法：** 各項目のカラーピッカーで色を選択 →「保存」ボタンを押すと反映されます  
-**リセット：**「デフォルトに戻す」ボタンで初期色に戻せます  
+**色の変更方法：** 各項目のカラーピッカーで色を選択 →「保存」ボタンを押すと反映されます
+**リシット：**「デフォルトに戻す」ボタンで初期色に戻せます
 ⚠️ 設定は館ごとに保存されます
         """)
 
@@ -421,14 +444,13 @@ def page_colors(館):
     with col1:
         if st.button("💾 保存", type="primary", use_container_width=True):
             save_colors(館, updated)
-            st.success("✅ カラー設定を保存しました。次回のExcel出力から反映されます。")
+            st.success("✅ カラー設定を保存しました。次回はExcel出力から反映されます。")
     with col2:
         if st.button("🔄 デフォルトに戻す", use_container_width=True):
             reset_colors(館)
             st.success("✅ デフォルト色に戻しました。")
             st.rerun()
 
-    # プレビュー
     st.divider()
     st.subheader("プレビュー")
     st.caption("現在の色設定のイメージ")
@@ -451,6 +473,7 @@ def page_colors(館):
             f'text-align:center;font-size:11px">氏名欄</div>',
             unsafe_allow_html=True)
 
+
 # ════ セッション初期化 ════════════════════════════════════════
 if "routes" not in st.session_state:
     st.session_state.routes = None
@@ -458,8 +481,23 @@ if "routes" not in st.session_state:
 # ════ サイドバー ══════════════════════════════════════════════
 with st.sidebar:
     st.title("🚐 送迎表ツール")
-    st.caption("v0.6")
+    st.caption("v0.7")
     館 = st.selectbox("事業所", ["Ⅰ番館","Ⅱ番館","Ⅲ番館","Ⅴ番館"], key="館")
+    st.divider()
+
+    # データ保存状態
+    if is_gsheet_configured():
+        st.success("☁️ Google Sheets連携 ON", icon="✅")
+    else:
+        st.warning("💾 ローカル保存（要設定）", icon="⚠️")
+        with st.expander("Google Sheets設定方法"):
+            st.markdown("""
+1. Google Cloud Console でサービスアカウントを作成
+2. Google Sheets API を有効化
+3. スプレッドシートを作成してサービスアカウントと共有
+4. Streamlit Cloud → App設定 → Secrets に認証情報を追加
+            """)
+
     st.divider()
     nav = st.radio("", ["📅 当日入力・送迎表生成",
                         "👥 利用者マスタ管理",
