@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from datetime import datetime, time, date
 
+from color_config import (load_colors, save_colors, reset_colors,
+                          COLOR_LABELS, COLOR_GROUPS, DEFAULT_COLORS)
 from master import (load_master, save_master, import_from_ritalico,
                     load_history_list, load_history, MASTER_COLUMNS)
 from routing import generate_routes
@@ -192,7 +194,10 @@ def page_daily(館):
         td = st.session_state.target_date
         fname = f"{td.strftime('%Y%m%d')}_{館}送迎表.xlsx"
         excel_bytes = export_schedule(
-            edited, td, 館, st.session_state.get("staff_on_duty", {}))
+            edited, td, 館,
+            st.session_state.get("staff_on_duty", {}),
+            master_df=load_master(館),
+            colors=load_colors(館))
         col1, col2 = st.columns(2)
         with col1:
             st.download_button(
@@ -267,6 +272,7 @@ def page_master(館):
                 "迎え時刻（長期休み）": st.column_config.TextColumn("迎え時刻(長休) HH:MM"),
                 "送り時刻":            st.column_config.TextColumn("送り時刻 HH:MM"),
                 "利用曜日":            st.column_config.TextColumn("利用曜日(例:月水金)"),
+                "特記事項":           st.column_config.TextColumn("特記事項（連絡先・引き渡しルールなど）"),
                 "備考":               st.column_config.TextColumn("備考"),
             },
             hide_index=False,
@@ -384,6 +390,67 @@ def page_vehicles(館):
             save_staff(館, es.to_dict("records")); st.success("✅ 保存しました")
 
 
+
+
+# ════ ページ: カラー設定 ═══════════════════════════════════
+def page_colors(館):
+    with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
+        st.markdown("""
+**色の変更方法：** 各項目のカラーピッカーで色を選択 →「保存」ボタンを押すと反映されます  
+**リセット：**「デフォルトに戻す」ボタンで初期色に戻せます  
+⚠️ 設定は館ごとに保存されます
+        """)
+
+    st.header(f"🎨 カラー設定 — {館}")
+    st.caption("送迎表Excelの各セルの色を自由に設定できます。")
+
+    colors = load_colors(館)
+    updated = dict(colors)
+
+    for group_name, keys in COLOR_GROUPS.items():
+        st.subheader(group_name)
+        cols = st.columns(len(keys))
+        for i, key in enumerate(keys):
+            label = COLOR_LABELS.get(key, key)
+            val = colors.get(key, "#FFFFFF")
+            picked = cols[i].color_picker(label, value=val, key=f"cp_{key}")
+            updated[key] = picked
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 保存", type="primary", use_container_width=True):
+            save_colors(館, updated)
+            st.success("✅ カラー設定を保存しました。次回のExcel出力から反映されます。")
+    with col2:
+        if st.button("🔄 デフォルトに戻す", use_container_width=True):
+            reset_colors(館)
+            st.success("✅ デフォルト色に戻しました。")
+            st.rerun()
+
+    # プレビュー
+    st.divider()
+    st.subheader("プレビュー")
+    st.caption("現在の色設定のイメージ")
+    cols = st.columns(5)
+    preview_items = [
+        ("迎え（放デイ）", "迎え_放デイ_バッジ", "迎え_放デイ_氏名"),
+        ("迎え（児発）",   "迎え_児発_バッジ",   "迎え_児発_氏名"),
+        ("送り",           "送り_バッジ",         "送り_氏名"),
+        ("特記事項",       "特記事項",            "特記事項"),
+        ("急遽追加",       "急遽追加_バッジ",     "急遽追加_氏名"),
+    ]
+    for i, (label, badge_key, name_key) in enumerate(preview_items):
+        badge_c = updated.get(badge_key, "#FFFFFF")
+        name_c  = updated.get(name_key,  "#FFFFFF")
+        cols[i].markdown(
+            f'<div style="text-align:center;font-size:11px;margin-bottom:4px">{label}</div>'
+            f'<div style="background:{badge_c};padding:4px;border-radius:4px 4px 0 0;'
+            f'text-align:center;font-size:11px;font-weight:bold">バッジ</div>'
+            f'<div style="background:{name_c};padding:4px;border-radius:0 0 4px 4px;'
+            f'text-align:center;font-size:11px">氏名欄</div>',
+            unsafe_allow_html=True)
+
 # ════ セッション初期化 ════════════════════════════════════════
 if "routes" not in st.session_state:
     st.session_state.routes = None
@@ -396,7 +463,8 @@ with st.sidebar:
     st.divider()
     nav = st.radio("", ["📅 当日入力・送迎表生成",
                         "👥 利用者マスタ管理",
-                        "🚗 車両・スタッフ設定"],
+                        "🚗 車両・スタッフ設定",
+                        "🎨 カラー設定"],
                    label_visibility="collapsed")
 
 # ════ ルーティング ════════════════════════════════════════════
@@ -406,3 +474,5 @@ elif nav == "👥 利用者マスタ管理":
     page_master(館)
 elif nav == "🚗 車両・スタッフ設定":
     page_vehicles(館)
+elif nav == "🎨 カラー設定":
+    page_colors(館)
