@@ -58,12 +58,12 @@ def save_staff(館, data):
 def page_daily(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
-**【STEP 1】** 対象日を選ぶ → 曜日が自動表示されます
-**【STEP 2】** 参加者チェック — その曜日の固定利用者に自動でチェックが入ります。欠席者はチェックを外し、追加参加者はチェックを入れてください
-**【STEP 3】** 迎え時刻を確認・修正 — 当日の下校時刻が変わる場合はここで変更します
-**【STEP 4】** 本日のスタッフ勤務状況を確認・修正
+**【STEP 1】** 対象日を選ぶ → 曜日が自動表示
+**【STEP 2】** 固定利用者は上部に自動ソート。休校チェックで迎え先が「自宅」に切替
+**【STEP 3】** 迎え先・送り先はプルダウンで選択、時刻も確認・修正
+**【STEP 4】** スタッフ勤務状況を確認・修正
 **【STEP 5】**「送迎ルートを自動生成」ボタンを押す
-**【STEP 6】** 生成されたルートを確認・修正（車両ごとのドライバー設定も可能）
+**【STEP 6】** 生成されたルートを確認・修正
 **【STEP 7】** 「Excelをダウンロード」
         """)
 
@@ -83,52 +83,151 @@ def page_daily(館):
     with col_m:
         is_long = st.toggle("長期休み", value=False, help="夏休み・冬休みなど長期休暇中はON")
 
-    wday = WEEKDAYS[target_date.weekday()]
+    wday       = WEEKDAYS[target_date.weekday()]
+    place_col  = "迎え先（長期休み）" if is_long else "迎え先（平日）"
+    time_col_p = "迎え時刻（長期休み）" if is_long else "迎え時刻（平日）"
 
-    # ── 参加者テーブル ──
+    # ── ソート：固定利用者を上部に ──
+    df_work = master_df.copy()
+    df_work["_fixed"] = df_work["利用曜日"].apply(lambda x: wday in str(x))
+    df_sorted = pd.concat([
+        df_work[df_work["_fixed"]],
+        df_work[~df_work["_fixed"]],
+    ], ignore_index=True)
+
+    # ── 迎え先・送り先の選択肢 ──
+    def _build_opts(*cols):
+        s = set()
+        for c in cols:
+            if c in master_df.columns:
+                for v in master_df[c].dropna():
+                    v = str(v).strip()
+                    if v and v not in ("None", "なし", ""):
+                        s.add(v)
+        return ["自宅", "なし"] + sorted(s - {"自宅"})
+
+    pickup_opts_base  = _build_opts("迎え先（平日）", "迎え先（長期休み）")
+    dropoff_opts_base = _build_opts("送り先")
+
+    # ── 検索フィルター ──
     st.subheader("参加者チェック")
-    st.caption("その曜日の固定利用者には自動でチェックが入っています。当日の変更に合わせて調整してください。")
+    col_srch, col_cnt = st.columns([4, 1])
+    search_q = col_srch.text_input(
+        "🔍", placeholder="氏名・地区で絞り込み",
+        key="daily_search", label_visibility="collapsed")
+    fixed_count = int(df_work["_fixed"].sum())
+    col_cnt.metric("固定", f"{fixed_count}名")
 
-    attendance = {}
-    time_overrides = {}
-    notes_map = {}
+    df_display = df_sorted.copy()
+    if search_q:
+        mask = (
+            df_display["氏名"].str.contains(search_q, na=False, case=False) |
+            df_display.get("地区", pd.Series("", index=df_display.index))
+            .str.contains(search_q, na=False, case=False)
+        )
+        df_display = df_display[mask]
+
+    st.caption("💡 固定曜日利用者が上部に表示 / 休校チェックで迎え先が自宅になります")
+
+    attendance          = {}
+    time_overrides      = {}
+    send_time_overrides = {}
+    pickup_overrides    = {}
+    dropoff_overrides   = {}
 
     with st.container(border=True):
-        hcols = st.columns([0.05, 0.18, 0.1, 0.18, 0.17, 0.12, 0.12, 0.08])
-        for c, h in zip(hcols, ["参加","氏名","区分","迎え先","迎え時刻","地区","送り先","備考"]):
+        hcols = st.columns([0.04, 0.13, 0.06, 0.16, 0.09, 0.05, 0.16, 0.09, 0.06, 0.10])
+        for c, h in zip(hcols,
+                        ["参加","氏名","区分","迎え先","迎え時刻",
+                         "地区","送り先","送り時刻","休校","備考"]):
             c.markdown(f"**{h}**")
-        st.divider()
 
-        for idx, row in master_df.iterrows():
-            rdays = str(row.get("利用曜日",""))
-            default_attend = wday in rdays if rdays else False
+        prev_fixed = None
+        for pos, row in df_display.iterrows():
+            is_fixed = bool(row.get("_fixed", False))
 
-            place_col = "迎え先（長期休み）" if is_long else "迎え先（平日）"
-            time_col  = "迎え時刻（長期休み）" if is_long else "迎え時刻（平日）"
-            place = row.get(place_col,"") or row.get("住所","自宅") or "自宅"
-            t_default = _str_to_time(row.get(time_col,"15:00"))
+            # グループ境界線
+            if prev_fixed is True and not is_fixed:
+                st.markdown("---")
+                st.caption("⬇️ 固定曜日外（追加参加の場合はチェック）")
+            elif prev_fixed is not None:
+                st.markdown(
+                    '<hr style="border:none;border-top:1px solid #EBEBEB;margin:2px 0">',
+                    unsafe_allow_html=True)
 
-            rc = st.columns([0.05, 0.18, 0.1, 0.18, 0.17, 0.12, 0.12, 0.08])
-            attend = rc[0].checkbox("", value=default_attend,
-                                    key=f"att_{idx}", label_visibility="collapsed")
-            rc[1].write(row.get("氏名",""))
-            ku = row.get("区分","")
+            place_def      = str(row.get(place_col, "") or "自宅").strip() or "自宅"
+            t_def          = _str_to_time(row.get(time_col_p, "15:00"))
+            send_place_def = str(row.get("送り先", "") or "自宅").strip() or "自宅"
+            send_t_def     = _str_to_time(row.get("送り時刻", "17:00"), default="17:00")
+            ika            = str(row.get("医ケア", "")).strip()
+
+            # 現在値が選択肢にない場合は追加
+            pickup_opts = list(pickup_opts_base)
+            if place_def not in pickup_opts:
+                pickup_opts.insert(2, place_def)
+            dropoff_opts = list(dropoff_opts_base)
+            if send_place_def not in dropoff_opts:
+                dropoff_opts.insert(2, send_place_def)
+
+            rc = st.columns([0.04, 0.13, 0.06, 0.16, 0.09, 0.05, 0.16, 0.09, 0.06, 0.10])
+
+            attend = rc[0].checkbox("", value=is_fixed,
+                                    key=f"att_{pos}", label_visibility="collapsed")
+
+            name_str = str(row.get("氏名", ""))
+            if ika:
+                rc[1].markdown(f"⚕️ **{name_str}**", help=f"医療的ケア: {ika}")
+            else:
+                rc[1].write(name_str)
+
+            ku = str(row.get("区分", ""))
+            badge_color = "#D9E1F2" if ku == "児発" else "#E2EFDA"
             rc[2].markdown(
-                f'<span style="background:#D9E1F2;padding:2px 6px;border-radius:4px;font-size:12px">{ku}</span>'
-                if ku == "児発" else
-                f'<span style="background:#E2EFDA;padding:2px 6px;border-radius:4px;font-size:12px">{ku}</span>',
+                f'<span style="background:{badge_color};padding:2px 4px;'
+                f'border-radius:3px;font-size:11px">{ku}</span>',
                 unsafe_allow_html=True)
-            rc[3].write(place)
-            t_new = rc[4].time_input("", value=t_default, key=f"t_{idx}",
-                                      label_visibility="collapsed", step=300)
-            rc[5].write(row.get("地区",""))
-            rc[6].write(row.get("送り先","") or row.get("住所","自宅") or "自宅")
-            note = rc[7].text_input("", key=f"note_{idx}", label_visibility="collapsed",
-                                     placeholder="メモ")
 
-            attendance[idx] = attend
-            time_overrides[idx] = str(t_new)
-            notes_map[idx] = note
+            # 休校チェック（迎え先を自宅に強制）
+            school_hol = rc[8].checkbox("", key=f"hol_{pos}",
+                                         label_visibility="collapsed", help="学校が休校")
+
+            if school_hol:
+                rc[3].caption("🏠 自宅（休校）")
+                effective_pickup = "自宅"
+            else:
+                try:
+                    pick_idx = pickup_opts.index(place_def)
+                except ValueError:
+                    pick_idx = 0
+                effective_pickup = rc[3].selectbox(
+                    "", options=pickup_opts, index=pick_idx,
+                    key=f"pick_{pos}", label_visibility="collapsed")
+
+            t_new = rc[4].time_input("", value=t_def, key=f"t_{pos}",
+                                      step=300, label_visibility="collapsed")
+
+            rc[5].caption(str(row.get("地区", "")))
+
+            try:
+                drop_idx = dropoff_opts.index(send_place_def)
+            except ValueError:
+                drop_idx = 0
+            effective_dropoff = rc[6].selectbox(
+                "", options=dropoff_opts, index=drop_idx,
+                key=f"drop_{pos}", label_visibility="collapsed")
+
+            send_t_new = rc[7].time_input("", value=send_t_def, key=f"st_{pos}",
+                                           step=300, label_visibility="collapsed")
+
+            note = rc[9].text_input("", key=f"note_{pos}",
+                                     label_visibility="collapsed", placeholder="メモ")
+
+            prev_fixed                = is_fixed
+            attendance[pos]           = attend
+            time_overrides[pos]       = str(t_new)[:5]
+            send_time_overrides[pos]  = str(send_t_new)[:5]
+            pickup_overrides[pos]     = effective_pickup
+            dropoff_overrides[pos]    = effective_dropoff
 
     # ── スタッフ ──
     st.subheader("本日のスタッフ")
@@ -139,7 +238,7 @@ def page_daily(館):
         for i, s in enumerate(staff_data):
             drive = s.get("運転可", False)
             icon = "🚗" if drive else "👤"
-            on = cols4[i % 5].checkbox(f"{icon} {s['氏名']}", value=True, key=f"st_{i}")
+            on = cols4[i % 5].checkbox(f"{icon} {s['氏名']}", value=True, key=f"stf_{i}")
             staff_on_duty[s["氏名"]] = {
                 "on": on, "drive": drive and on,
                 "work_time": s.get("勤務時間", "9:30-18:30")}
@@ -148,15 +247,22 @@ def page_daily(館):
 
     st.divider()
     if st.button("🚐 送迎ルートを自動生成", type="primary", use_container_width=True):
-        flags = [attendance.get(i, False) for i in range(len(master_df))]
-        parts = master_df[flags].copy()
-        if parts.empty:
+        attending_rows = []
+        for pos, row in df_display.iterrows():
+            if not attendance.get(pos, False):
+                continue
+            r = {c: row.get(c, "") for c in master_df.columns}
+            r[time_col_p] = time_overrides.get(pos, r.get(time_col_p, "15:00"))
+            r["送り時刻"] = send_time_overrides.get(pos, r.get("送り時刻", "17:00"))
+            r[place_col]  = pickup_overrides.get(pos, r.get(place_col, "自宅"))
+            r["送り先"]   = dropoff_overrides.get(pos, r.get("送り先", "自宅"))
+            attending_rows.append(r)
+
+        if not attending_rows:
             st.error("参加者が選択されていません")
             return
-        time_col = "迎え時刻（長期休み）" if is_long else "迎え時刻（平日）"
-        for orig_idx, t_str in time_overrides.items():
-            if orig_idx in parts.index:
-                parts.loc[orig_idx, time_col] = t_str
+
+        parts = pd.DataFrame(attending_rows)
         vehicles = load_vehicles(館)
         drivers = [n for n, i in staff_on_duty.items() if i.get("drive")]
         routes = generate_routes(parts, vehicles, drivers, is_long_holiday=is_long)
@@ -172,7 +278,6 @@ def page_daily(館):
         st.subheader("🗺️ 生成ルート（確認・修正）")
         routes = st.session_state.routes
 
-        # 運転可能なスタッフ一覧
         sod = st.session_state.get("staff_on_duty", {})
         drivers_on_duty = [n for n, i in sod.items() if i.get("drive")]
 
@@ -182,7 +287,6 @@ def page_daily(館):
                 col_vh, col_drv = st.columns([3, 2])
                 col_vh.markdown(f"#### 🚐 {vehicle}")
 
-                # 車両ごとのデフォルトドライバー（全便一括設定）
                 drv_opts = ["（便ごとに設定）"] + drivers_on_duty
                 veh_driver = col_drv.selectbox(
                     "担当ドライバー（全便に一括適用）",
@@ -190,7 +294,6 @@ def page_daily(館):
                     key=f"veh_drv_{vehicle}",
                 )
 
-                # 一括適用の場合は全tripsのdriverを上書き
                 effective_trips = []
                 for t in trips:
                     t2 = dict(t)
@@ -263,7 +366,7 @@ def _trip_editor(trips, vehicle, trip_type, drivers=None):
                         "place":place,"driver":driver})
     return edited
 
-# ════ ページ: 利用者マスタ ════════════════════════════════════
+# ════ ページ: 利用者マスタ ════════════════════════════════════════
 def page_master(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
@@ -285,7 +388,7 @@ def page_master(館):
         "✏️ 手動編集", "📋 内部CSV取込", "📂 リタリコCSV", "🗺️ 住所検索", "🕐 変更履歴",
     ])
 
-    # ── 手動編集 ──────────────────────────────────────────────
+    # ── 手動編集 ─────────────────────────────────────────────────────────
     with tab_edit:
         master_df = load_master(館)
         if master_df.empty:
@@ -327,7 +430,7 @@ def page_master(館):
             st.success(f"✅ {len(edited)}件を保存しました")
             st.rerun()
 
-    # ── 内部CSV取込 ───────────────────────────────────────────
+    # ── 内部CSV取込 ───────────────────────────────────────────────────
     with tab_csv:
         st.subheader("内部利用者一覧CSV を取込")
         st.info("""
@@ -401,7 +504,7 @@ def page_master(館):
                 key="merge_mode",
             )
 
-            if st.button("📥 取込・保存", type="primary"):
+            if st.button("📥 取込・保存", type="primary"):ry"):
                 targets = [館] if "現在" in import_target else ["Ⅰ番館", "Ⅱ番館", "Ⅲ番館", "Ⅴ番館"]
                 saved_total = 0
                 for h in targets:
@@ -434,7 +537,7 @@ def page_master(館):
                 st.success(f"✅ {saved_total}件を保存しました（{', '.join(targets)}）")
                 st.rerun()
 
-    # ── リタリコCSV ───────────────────────────────────────────
+    # ── リタリコCSV ───────────────────────────────────────
     with tab_ritalico:
         st.subheader("リタリコCSVをインポート")
         st.info("リタリコから「保護者一覧」などのCSVをエクスポートしてアップロードしてください。")
@@ -487,7 +590,7 @@ def page_master(館):
                 st.dataframe(result_df[["氏名", "地区", "迎え先（平日）", "区分", "利用曜日"]],
                              use_container_width=True)
 
-    # ── 住所検索 ──────────────────────────────────────────────
+    # ── 住所検索 ────────────────────────────────────────────
     with tab_addr:
         st.subheader("🗺️ 送迎先 住所検索")
         master_df = load_master(館)
@@ -517,12 +620,12 @@ APIキーなしでも住所を手動入力して保存できます。
             # 住所マップ（施設名 → 住所）をロード
             addr_map = load_json_data(館, "address_map", default={})
 
-            st.write(f"**送迎先施設: {len(facilities)}件**")
+            st.write(f"送迎先施設: {len(facilities)}件**")
             changed = False
             for facility in facilities:
                 existing = addr_map.get(facility, "")
                 row_a, row_b, row_c = st.columns([2, 3, 1])
-                row_a.write(f"**{facility}**")
+                row_a.write(f"<{facility}>")
 
                 new_addr = row_b.text_input(
                     "住所", value=existing,
@@ -567,7 +670,7 @@ APIキーなしでも住所を手動入力して保存できます。
                 save_json_data(館, "address_map", addr_map)
                 st.success("✅ 保存しました")
 
-    # ── 変更履歴 ──────────────────────────────────────────────
+    # ── 変更履歴 ────────────────────────────────────────────
     with tab_hist:
         st.subheader("変更履歴")
         hist_list = load_history_list(館)
@@ -615,7 +718,7 @@ def page_vehicles(館):
             save_staff(館, es.to_dict("records")); st.success("✅ 保存しました")
 
 
-# ════ ページ: カラー設定 ═══════════════════════════════════════
+# ════ ページ: カラー設定 ═══════════════════════════════
 def page_colors(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
@@ -689,7 +792,7 @@ with st.sidebar:
     if is_gsheet_configured():
         st.success("☁️ Supabase連携 ON", icon="✅")
     else:
-        st.warning("💾 ローカル保存（要設定）", icon="⚠️")
+    　　st.warning("💾 ローカル保存（要設定）", icon="⚠️")
         with st.expander("Supabase設定方法"):
             st.markdown("""
 1. [supabase.com](https://supabase.com) でプロジェクトを作成
