@@ -606,51 +606,61 @@ def page_master(館):
         """)
 
         uploaded_h = st.file_uploader("保護者一覧CSVを選択", type=["csv"], key="hogosha_csv")
-        if uploaded_h:
-            raw_bytes = uploaded_h.read()
-            hdf = None
-            for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
-                try:
-                    import io as _io
-                    hdf = pd.read_csv(_io.BytesIO(raw_bytes), encoding=enc, dtype=str)
-                    st.caption(f"文字コード: {enc} で読込成功 ({len(hdf)}件)")
-                    break
-                except Exception:
-                    continue
+        if uploaded_h is not None:
+            try:
+                import io as _io
+                import traceback as _tb
+                raw_bytes = uploaded_h.read()
+                if not raw_bytes:
+                    st.error("ファイルが空です。再度アップロードしてください。")
+                else:
+                    hdf = None
+                    used_enc = None
+                    for enc in ("utf-8-sig", "cp932", "shift-jis", "utf-8"):
+                        try:
+                            hdf = pd.read_csv(_io.BytesIO(raw_bytes), encoding=enc, dtype=str)
+                            used_enc = enc
+                            break
+                        except Exception:
+                            continue
 
-            if hdf is None:
-                st.error("文字コードを判定できませんでした。"); st.stop()
+                    if hdf is None:
+                        st.error("文字コードを判定できませんでした。UTF-8 または Shift-JIS (cp932) の CSV をアップロードしてください。")
+                    else:
+                        st.caption(f"文字コード: {used_enc} で読込成功 ({len(hdf)}件)")
+                        preview_cols = [c for c in ("児童","都道府県","市区町村","番地","ビル・マンション名") if c in hdf.columns]
+                        st.write("**プレビュー（先頭3行）**")
+                        st.dataframe(hdf[preview_cols].head(3) if preview_cols else hdf.head(3),
+                                     use_container_width=True)
 
-            preview_cols = [c for c in ("児童","都道府県","市区町村","番地","ビル・マンション名") if c in hdf.columns]
-            st.write("**プレビュー（先頭3行）**")
-            st.dataframe(hdf[preview_cols].head(3) if preview_cols else hdf.head(3),
-                         use_container_width=True)
+                        master_df = load_master(館)
+                        if master_df.empty:
+                            st.warning("マスタが未登録です。先に利用者マスタを登録してください。")
+                        else:
+                            updated_df, matched, unmatched = import_address_from_hogosha_csv(hdf, master_df)
 
-            master_df = load_master(館)
-            if master_df.empty:
-                st.warning("マスタが未登録です。先に利用者マスタを登録してください。")
-            else:
-                updated_df, matched, unmatched = import_address_from_hogosha_csv(hdf, master_df)
+                            col_a, col_b = st.columns(2)
+                            col_a.metric("照合一致", f"{matched}名")
+                            col_b.metric("未一致",   f"{len(unmatched)}名")
 
-                col_a, col_b = st.columns(2)
-                col_a.metric("照合一致", f"{matched}名")
-                col_b.metric("未一致",   f"{len(unmatched)}名")
+                            if unmatched:
+                                with st.expander(f"⚠️ 未一致の児童名（{len(unmatched)}名）"):
+                                    st.write("、".join(unmatched))
 
-                if unmatched:
-                    with st.expander(f"⚠️ 未一致の児童名（{len(unmatched)}名）"):
-                        st.write("、".join(unmatched))
+                            changed_mask = updated_df["住所"] != master_df["住所"].reindex(
+                                updated_df.index, fill_value="")
+                            if changed_mask.any():
+                                st.write(f"**更新される住所（{changed_mask.sum()}件）**")
+                                st.dataframe(updated_df.loc[changed_mask, ["氏名","地区","住所"]],
+                                             use_container_width=True)
 
-                changed_mask = updated_df["住所"] != master_df["住所"].reindex(
-                    updated_df.index, fill_value="")
-                if changed_mask.any():
-                    st.write(f"**更新される住所（{changed_mask.sum()}件）**")
-                    st.dataframe(updated_df.loc[changed_mask, ["氏名","地区","住所"]],
-                                 use_container_width=True)
-
-                if st.button("💾 住所を保存する", type="primary", key="hogosha_save"):
-                    save_master(館, updated_df)
-                    st.success(f"✅ {matched}名の住所を保存しました")
-                    st.rerun()
+                            if st.button("💾 住所を保存する", type="primary", key="hogosha_save"):
+                                save_master(館, updated_df)
+                                st.success(f"✅ {matched}名の住所を保存しました")
+                                st.rerun()
+            except Exception as _e:
+                st.error(f"処理中にエラーが発生しました: {_e}")
+                st.code(_tb.format_exc())
 
     # ── 内部CSV取込 ───────────────────────────────────────────
     with tab_csv:
