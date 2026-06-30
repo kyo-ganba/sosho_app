@@ -190,7 +190,7 @@ def page_daily(館):
             if new_pickup_val.strip() and new_pickup_val.strip() not in custom_places["pickup"]:
                 custom_places["pickup"].append(new_pickup_val.strip()); changed = True
             if new_dropoff_val.strip() and new_dropoff_val.strip() not in custom_places["dropoff"]:
-                customplaces["dropoff"].append(new_dropoff_val.strip()); changed = True
+                custom_places["dropoff"].append(new_dropoff_val.strip()); changed = True
             if changed:
                 save_custom_places(館, custom_places)
                 st.success("✅ 追加しました"); st.rerun()
