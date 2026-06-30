@@ -895,4 +895,4 @@ def page_master(館):
                 st.warning("⚠️ Google Maps APIキーが未設定です（Secrets に [google_maps] api_key を追加してください）")
 
             addr_map = load_json_data(館, "address_map", default={})
-                                                                                                                                              
+        
