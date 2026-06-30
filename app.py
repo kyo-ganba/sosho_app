@@ -1,8 +1,9 @@
 """
-送迎表作成ツール v0.7
-- 運転者を便・車両ごとに手動設定できるUI
-- Supabase永続化（storage.py経由）
-- データ保存状態をサイドバーに表示
+送迎表作成ツール v0.8
+- 時刻入力: プルダウン（5分刻み）＋手入力 両対応
+- 迎え先/送り先: カスタム場所の追加・削除
+- デフォルト事業所: URLパラメータ ?kan�Ⅱ番館 でブックマーク可能
+- スタッフ勤務: A/B/C勤・半休・有休・カスタム勤務時間対応
 """
 import streamlit as st
 import pandas as pd
@@ -26,6 +27,25 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 WEEKDAYS = ["月","火","水","木","金","土","日"]
+HALLS    = ["Ⅰ番館","Ⅱ番館","Ⅲ番館","Ⅴ番館"]
+
+# ── 勤務区分プリセット: (開始, 終了) または None ──────────────
+SHIFT_PRESETS = {
+    "A勤":      ("09:00", "18:00"),
+    "B勤":      ("09:30", "18:30"),
+    "C勤":      ("10:00", "19:00"),
+    "半休AM":   ("09:00", "13:00"),
+    "半休PM":   ("13:00", "18:30"),
+    "カスタム": None,
+    "有休":     None,
+    "欠勤":     None,
+}
+_OFF_SHIFTS = {"有休", "欠勤"}
+
+# ── 時刻クイック選択（5分刻み 12:00〜19:00）────────────────────
+_QUICK_TIMES = [f"{h:02d}:{m:02d}"
+                for h in range(12, 20)
+                for m in range(0, 60, 5)]
 
 # ════ ヘルパー ════════════════════════════════════════════════
 def _str_to_time(s, default="15:00"):
@@ -38,6 +58,17 @@ def _str_to_time(s, default="15:00"):
             return time(int(parts[0]), int(parts[1]))
         except Exception:
             return time(15, 0)
+
+def _validate_hhmm(s):
+    """HH:MM形式を検証。正規化文字列 or None。"""
+    try:
+        parts = str(s).strip().split(":")
+        h, m = int(parts[0]), int(parts[1][:2])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return f"{h:02d}:{m:02d}"
+    except Exception:
+        pass
+    return None
 
 def load_vehicles(館):
     return load_json_data(館, "vehicles", default=[
@@ -54,14 +85,47 @@ def load_staff(館):
 def save_staff(館, data):
     save_json_data(館, "staff", data)
 
+def load_custom_places(館):
+    return load_json_data(館, "custom_places",
+                          default={"pickup": [], "dropoff": []})
+
+def save_custom_places(館, data):
+    save_json_data(館, "custom_places", data)
+
+
+def _time_cell(col, default_str, base_key):
+    """
+    時刻入力ウィジェット（プルダウン＋手入力兼用）。
+    ・_QUICK_TIMES に含まれる時刻 → selectbox でその値を選択
+    ・含まれない           → "✍️ 手入力" を選択 + text_input に値を表示
+    Returns: "HH:MM" 文字列
+    """
+    opts = _QUICK_TIMES + ["✍️ 手入力"]
+    if default_str in _QUICK_TIMES:
+        def_idx = _QUICK_TIMES.index(default_str)
+    else:
+        def_idx = len(opts) - 1          # "✍️ 手入力"
+
+    sel = col.selectbox("", opts, index=def_idx,
+                        key=f"{base_key}_sel",
+                        label_visibility="collapsed")
+    if sel == "✍️ 手入力":
+        raw = col.text_input("", value=default_str,
+                             key=f"{base_key}_txt",
+                             label_visibility="collapsed",
+                             placeholder="HH:MM", max_chars=5)
+        v = _validate_hhmm(raw)
+        return v if v else default_str
+    return sel
+
 # ════ ページ: 当日入力 ════════════════════════════════════════
 def page_daily(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
 **【STEP 1】** 対象日を選ぶ → 曜日が自動表示
 **【STEP 2】** 固定利用者は上部に自動ソート。休校チェックで迎え先が「自宅」に切替
-**【STEP 3】** 迎え先・送り先はプルダウンで選択、時刻も確認・修正
-**【STEP 4】** スタッフ勤務状況を確認・修正
+**【STEP 3】** 迎え先・送り先をプルダウンまたは手入力で確認・修正（🏫 で新規追加可）
+**【STEP 4】** スタッフ勤務状況・勤務区分を確認・修正
 **【STEP 5】**「送迎ルートを自動生成」ボタンを押す
 **【STEP 6】** 生成されたルートを確認・修正
 **【STEP 7】** 「Excelをダウンロード」
@@ -95,9 +159,12 @@ def page_daily(館):
         df_work[~df_work["_fixed"]],
     ], ignore_index=True)
 
-    # ── 迎え先・送り先の選択肢 ──
-    def _build_opts(*cols):
-        s = set()
+    # ── カスタム送迎先の読み込み ──
+    custom_places = load_custom_places(館)
+
+    # ── 迎え先・送り先の選択肢（マスタ＋カスタム）──
+    def _build_opts(*cols, extras=None):
+        s = set(extras or [])
         for c in cols:
             if c in master_df.columns:
                 for v in master_df[c].dropna():
@@ -106,8 +173,40 @@ def page_daily(館):
                         s.add(v)
         return ["自宅", "なし"] + sorted(s - {"自宅"})
 
-    pickup_opts_base  = _build_opts("迎え先（平日）", "迎え先（長期休み）")
-    dropoff_opts_base = _build_opts("送り先")
+    pickup_opts_base  = _build_opts("迎え先（平日）", "迎え先（長期休み）",
+                                    extras=custom_places.get("pickup", []))
+    dropoff_opts_base = _build_opts("送り先",
+                                    extras=custom_places.get("dropoff", []))
+
+    # ── 送迎先管理（新規追加・削除）──
+    with st.expander("🏫 送迎先を追加・管理", expanded=False):
+        p_col, d_col, btn_col = st.columns([3, 3, 1])
+        new_pickup_val  = p_col.text_input("迎え先を追加", key="new_pickup_add",
+                                            placeholder="例: ○○小学校")
+        new_dropoff_val = d_col.text_input("送り先を追加", key="new_dropoff_add",
+                                            placeholder="例: ○○デイ")
+        if btn_col.button("＋ 追加", key="add_custom_places", use_container_width=True):
+            changed = False
+            if new_pickup_val.strip() and new_pickup_val.strip() not in custom_places["pickup"]:
+                custom_places["pickup"].append(new_pickup_val.strip()); changed = True
+            if new_dropoff_val.strip() and new_dropoff_val.strip() not in custom_places["dropoff"]:
+                customplaces["dropoff"].append(new_dropoff_val.strip()); changed = True
+            if changed:
+                save_custom_places(館, custom_places)
+                st.success("✅ 追加しました"); st.rerun()
+
+        if custom_places["pickup"] or custom_places["dropoff"]:
+            st.caption("登録済みカスタム送迎先（🗑️ で削除）")
+            pl, dl = st.columns(2)
+            pl.markdown("**迎え先**"); dl.markdown("**送り先**")
+            for p in list(custom_places["pickup"]):
+                if pl.button(f"🗑️ {p}", key=f"rm_pickup_{p}"):
+                    custom_places["pickup"].remove(p)
+                    save_custom_places(館, custom_places); st.rerun()
+            for d in list(custom_places["dropoff"]):
+                if dl.button(f"🗑️ {d}", key=f"rm_dropoff_{d}"):
+                    custom_places["dropoff"].remove(d)
+                    save_custom_places(館, custom_places); st.rerun()
 
     # ── 検索フィルター ──
     st.subheader("参加者チェック")
@@ -155,16 +254,16 @@ def page_daily(館):
                     '<hr style="border:none;border-top:1px solid #EBEBEB;margin:2px 0">',
                     unsafe_allow_html=True)
 
-            place_def      = str(row.get(place_col, "") or "自宅").strip() or "自宅"
-            t_def          = _str_to_time(row.get(time_col_p, "15:00"))
+            place_def_raw  = str(row.get(place_col, "") or "自宅").strip() or "自宅"
+            t_def_str      = str(row.get(time_col_p, "15:00") or "15:00")[:5]
             send_place_def = str(row.get("送り先", "") or "自宅").strip() or "自宅"
-            send_t_def     = _str_to_time(row.get("送り時刻", "17:00"), default="17:00")
+            send_t_def_str = str(row.get("送り時刻", "17:00") or "17:00")[:5]
             ika            = str(row.get("医ケア", "")).strip()
 
             # 現在値が選択肢にない場合は追加
             pickup_opts = list(pickup_opts_base)
-            if place_def not in pickup_opts:
-                pickup_opts.insert(2, place_def)
+            if place_def_raw not in pickup_opts:
+                pickup_opts.insert(2, place_def_raw)
             dropoff_opts = list(dropoff_opts_base)
             if send_place_def not in dropoff_opts:
                 dropoff_opts.insert(2, send_place_def)
@@ -196,15 +295,15 @@ def page_daily(館):
                 effective_pickup = "自宅"
             else:
                 try:
-                    pick_idx = pickup_opts.index(place_def)
+                    pick_idx = pickup_opts.index(place_def_raw)
                 except ValueError:
                     pick_idx = 0
                 effective_pickup = rc[3].selectbox(
                     "", options=pickup_opts, index=pick_idx,
                     key=f"pick_{pos}", label_visibility="collapsed")
 
-            t_new = rc[4].time_input("", value=t_def, key=f"t_{pos}",
-                                      step=300, label_visibility="collapsed")
+            # 迎え時刻（プルダウン＋手入力）
+            t_new_str = _time_cell(rc[4], t_def_str, f"t_{pos}")
 
             rc[5].caption(str(row.get("地区", "")))
 
@@ -216,34 +315,86 @@ def page_daily(館):
                 "", options=dropoff_opts, index=drop_idx,
                 key=f"drop_{pos}", label_visibility="collapsed")
 
-            send_t_new = rc[7].time_input("", value=send_t_def, key=f"st_{pos}",
-                                           step=300, label_visibility="collapsed")
+            # 送り時刻（プルダウン＋手入力）
+            send_t_new_str = _time_cell(rc[7], send_t_def_str, f"st_{pos}")
 
             note = rc[9].text_input("", key=f"note_{pos}",
                                      label_visibility="collapsed", placeholder="メモ")
 
             prev_fixed                = is_fixed
             attendance[pos]           = attend
-            time_overrides[pos]       = str(t_new)[:5]
-            send_time_overrides[pos]  = str(send_t_new)[:5]
+            time_overrides[pos]       = t_new_str
+            send_time_overrides[pos]  = send_t_new_str
             pickup_overrides[pos]     = effective_pickup
             dropoff_overrides[pos]    = effective_dropoff
 
-    # ── スタッフ ──
-    st.subheader("本日のスタッフ")
+    # ── スタッフ勤務状況 ──
+    st.subheader("👤 本日のスタッフ勤務状況")
     staff_data = load_staff(館)
     staff_on_duty = {}
-    if staff_data:
-        cols4 = st.columns(min(len(staff_data), 5))
-        for i, s in enumerate(staff_data):
-            drive = s.get("運転可", False)
-            icon = "🚗" if drive else "👤"
-            on = cols4[i % 5].checkbox(f"{icon} {s['氏名']}", value=True, key=f"stf_{i}")
-            staff_on_duty[s["氏名"]] = {
-                "on": on, "drive": drive and on,
-                "work_time": s.get("勤務時間", "9:30-18:30")}
-    else:
+
+    if not staff_data:
         st.info("スタッフ未登録 →「車両・スタッフ設定」で登録してください")
+    else:
+        shift_opts = list(SHIFT_PRESETS.keys())
+        # ヘッダー行
+        h0,h1,h2,h3,h4,h5 = st.columns([0.04,0.16,0.14,0.10,0.10,0.08])
+        for col, lbl in [(h0,"出勤"),(h1,"氏名"),(h2,"勤務区分"),(h3,"開始"),(h4,"終了"),(h5,"運転")]:
+            col.markdown(f"**{lbl}**")
+        st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
+
+        for i, s in enumerate(staff_data):
+            name      = s.get("氏名", f"staff_{i}")
+            can_drive = bool(s.get("運転可", False))
+            def_shift = s.get("default_shift", "B勤")
+            if def_shift not in shift_opts:
+                def_shift = "B勤"
+
+            c0,c1,c2,c3,c4,c5 = st.columns([0.04,0.16,0.14,0.10,0.10,0.08])
+
+            default_on = def_shift not in _OFF_SHIFTS
+            attend_s = c0.checkbox("", value=default_on,
+                                   key=f"stf_on_{i}", label_visibility="collapsed")
+
+            icon = "🚗" if can_drive else "👤"
+            c1.write(f"{icon} {name}")
+
+            def_idx = shift_opts.index(def_shift)
+            shift = c2.selectbox("", shift_opts, index=def_idx,
+                                 key=f"stf_shift_{i}", label_visibility="collapsed",
+                                 disabled=not attend_s)
+
+            is_off = (shift in _OFF_SHIFTS) or (not attend_s)
+            preset = SHIFT_PRESETS.get(shift)
+
+            if is_off:
+                c3.caption("—"); c4.caption("—")
+                work_start = work_end = ""
+            elif shift == "カスタム":
+                prev_s = s.get("custom_start", "09:30")
+                prev_e = s.get("custom_end",   "18:30")
+                ws = c3.text_input("", value=prev_s, key=f"stf_start_{i}",
+                                   label_visibility="collapsed", max_chars=5, placeholder="HH:MM")
+                we = c4.text_input("", value=prev_e, key=f"stf_end_{i}",
+                                   label_visibility="collapsed", max_chars=5, placeholder="HH:MM")
+                work_start = _validate_hhmm(ws) or prev_s
+                work_end   = _validate_hhmm(we) or prev_e
+            else:
+                work_start, work_end = preset
+                c3.caption(work_start); c4.caption(work_end)
+
+            drv_default = can_drive and attend_s and not is_off
+            drive_on = c5.checkbox("", value=drv_default,
+                                   key=f"stf_drv_{i}", label_visibility="collapsed",
+                                   disabled=(not can_drive or not attend_s or is_off))
+
+            staff_on_duty[name] = {
+                "on":         attend_s and not is_off,
+                "drive":      drive_on,
+                "shift":      shift,
+                "work_start": work_start,
+                "work_end":   work_end,
+            }
 
     st.divider()
     if st.button("🚐 送迎ルートを自動生成", type="primary", use_container_width=True):
@@ -366,7 +517,7 @@ def _trip_editor(trips, vehicle, trip_type, drivers=None):
                         "place":place,"driver":driver})
     return edited
 
-# ════ ページ: 利用者マスタ ════════════════════════════════════════
+# ════ ページ: 利用者マスタ ════════════════════════════════════
 def page_master(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
@@ -388,7 +539,7 @@ def page_master(館):
         "✏️ 手動編集", "📋 内部CSV取込", "📂 リタリコCSV", "🗺️ 住所検索", "🕐 変更履歴",
     ])
 
-    # ── 手動編集 ─────────────────────────────────────────────────────────
+    # ── 手動編集 ──────────────────────────────────────────────
     with tab_edit:
         master_df = load_master(館)
         if master_df.empty:
@@ -396,7 +547,7 @@ def page_master(館):
 
         st.caption(f"登録人数: {len(master_df)}名")
 
-        # 医ケア・重心バッジ
+        # 医ケア・重心バc��ジ
         if "医ケア" in master_df.columns:
             ika = master_df[master_df["医ケア"].str.strip().ne("")]
             if len(ika) > 0:
@@ -430,7 +581,7 @@ def page_master(館):
             st.success(f"✅ {len(edited)}件を保存しました")
             st.rerun()
 
-    # ── 内部CSV取込 ───────────────────────────────────────────────────
+    # ── 内部CSV取込 ───────────────────────────────────────────
     with tab_csv:
         st.subheader("内部利用者一覧CSV を取込")
         st.info("""
@@ -537,7 +688,7 @@ def page_master(館):
                 st.success(f"✅ {saved_total}件を保存しました（{', '.join(targets)}）")
                 st.rerun()
 
-    # ── リタリコCSV ───────────────────────────────────────
+    # ── リタリコCSV ───────────────────────────────────────────
     with tab_ritalico:
         st.subheader("リタリコCSVをインポート")
         st.info("リタリコから「保護者一覧」などのCSVをエクスポートしてアップロードしてください。")
@@ -590,12 +741,11 @@ def page_master(館):
                 st.dataframe(result_df[["氏名", "地区", "迎え先（平日）", "区分", "利用曜日"]],
                              use_container_width=True)
 
-    # ── 住所検索 ────────────────────────────────────────────
+    # ── 住所検索 ──────────────────────────────────────────────
     with tab_addr:
         st.subheader("🗺️ 送迎先 住所検索")
         master_df = load_master(館)
-        facilities = get_facilities_needing_address(master_df)
-
+        facilit
         if not facilities:
             st.info("送迎先の施設がありません。先に利用者マスタを取り込んでください。")
         else:
@@ -617,26 +767,17 @@ api_key = "AIza..."
 APIキーなしでも住所を手動入力して保存できます。
                 """)
 
-            # 住所マップ（施設名 → 住所）をロード
             addr_map = load_json_data(館, "address_map", default={})
-
             st.write(f"**送迎先施設: {len(facilities)}件**")
-            changed = False
             for facility in facilities:
                 existing = addr_map.get(facility, "")
                 row_a, row_b, row_c = st.columns([2, 3, 1])
                 row_a.write(f"**{facility}**")
-
                 new_addr = row_b.text_input(
-                    "住所", value=existing,
-                    key=f"addr_{facility}",
-                    label_visibility="collapsed",
-                    placeholder="住所を入力またはGoogle検索",
-                )
+                    "住所", value=existing, key=f"addr_{facility}",
+                    label_visibility="collapsed", placeholder="住所を入力またはGoogle検索")
                 if new_addr != existing:
                     addr_map[facility] = new_addr
-                    changed = True
-
                 search_ok = bool(api_key)
                 if row_c.button("🔍 検索", key=f"search_{facility}", disabled=not search_ok):
                     cands = lookup_address_google(facility, api_key)
@@ -644,33 +785,26 @@ APIキーなしでも住所を手動入力して保存できます。
                         st.session_state[f"cands_{facility}"] = cands
                     else:
                         st.warning(f"「{facility}」の住所が見つかりませんでした")
-
-                # 候補ボタン
                 for cand in st.session_state.get(f"cands_{facility}", [])[:3]:
                     addr = cand.get("formatted_address", "")
                     name = cand.get("name", "")
                     if st.button(f"✅ {name} — {addr}", key=f"pick_{facility}_{addr}"):
                         addr_map[facility] = addr
-                        # マスタの住所列も更新
                         updated = load_master(館)
-                        for place_col, addr_col in (
-                            ("迎え先（平日）", "迎え先住所"),
-                            ("迎え先（長期休み）", "迎え先住所"),
-                            ("送り先", "送り先住所"),
-                        ):
-                            if place_col in updated.columns and addr_col in updated.columns:
-                                updated.loc[updated[place_col] == facility, addr_col] = addr
+                        for pc, ac in (("迎え先（平日）","迎え先住所"),
+                                       ("迎え先（長期休み）","迎え先住所"),
+                                       ("送り先","送り先住所")):
+                            if pc in updated.columns and ac in updated.columns:
+                                updated.loc[updated[pc] == facility, ac] = addr
                         save_master(館, updated)
                         save_json_data(館, "address_map", addr_map)
                         del st.session_state[f"cands_{facility}"]
-                        st.success(f"✅ 保存: {addr}")
-                        st.rerun()
-
+                        st.success(f"✅ 保存: {addr}"); st.rerun()
             if st.button("💾 住所マップを保存", type="primary"):
                 save_json_data(館, "address_map", addr_map)
                 st.success("✅ 保存しました")
 
-    # ── 変更履歴 ────────────────────────────────────────────
+    # ── 変更履歴 ──────────────────────────────────────────────
     with tab_hist:
         st.subheader("変更履歴")
         hist_list = load_history_list(館)
@@ -679,24 +813,22 @@ APIキーなしでも住所を手動入力して保存できます。
         else:
             sel = st.selectbox(
                 "履歴を選択", hist_list,
-                format_func=lambda x: f"{x[:4]}/{x[4:6]}/{x[6:8]} {x[9:11]}:{x[11:13]}:{x[13:15]}",
-            )
+                format_func=lambda x: f"{x[:4]}/{x[4:6]}/{x[6:8]} {x[9:11]}:{x[11:13]}:{x[13:15]}")
             hist_df = load_history(館, sel)
             st.dataframe(hist_df, use_container_width=True)
             if st.button("⏪ この時点に戻す", type="secondary"):
                 save_master(館, hist_df)
-                st.success("✅ 復元しました")
-                st.rerun()
+                st.success("✅ 復元しました"); st.rerun()
 
 
-
-# ════ ページ: 車両・スタッフ ═══════════════════════════════════
+# ════ ページ: 車両・スタッフ ═════════════════════════════════
 def page_vehicles(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
 **【車両の追加・変更】**「車両」タブ → 表に入力 →「保存」ボタン
-**【スタッフの追加】**「スタッフ」タブ → 氏名・運転可否・勤務時間を入力 →「保存」ボタン
+**【スタッフの追加】**「スタッフ」タブ → 氏名・運転可否・標準勤務区分を入力 →「保存」ボタン
 ⚠️「運転可」にチェックがあるスタッフのみ、当日入力画面で運転者候補として表示されます
+⚠️「標準勤務」は当日入力画面でデフォルト値になります
         """)
 
     st.header(f"🚗 車両・スタッフ設定 — {館}")
@@ -710,15 +842,27 @@ def page_vehicles(館):
             save_vehicles(館, ev.to_dict("records")); st.success("✅ 保存しました")
 
     with tab_s:
-        sdf = pd.DataFrame(load_staff(館)) if load_staff(館) else \
-              pd.DataFrame(columns=["氏名","運転可","勤務時間","備考"])
+        raw_staff = load_staff(館)
+        sdf = pd.DataFrame(raw_staff) if raw_staff else \
+              pd.DataFrame(columns=["氏名","運転可","default_shift","custom_start","custom_end","備考"])
+        for col_name, col_def in [("運転可", False), ("default_shift", "B勤"),
+                                   ("custom_start", "09:30"), ("custom_end", "18:30"), ("備考", "")]:
+            if col_name not in sdf.columns:
+                sdf[col_name] = col_def
+        st.caption("💡 標準勤務: 当日入力画面の勤務区分デフォルト値。カスタム開始/終了は「カスタム」選択時は使用。")
         es = st.data_editor(sdf, num_rows="dynamic", use_container_width=True,
-                            column_config={"運転可": st.column_config.CheckboxColumn("運転可")})
+                            column_config={
+                                "運転可":        st.column_config.CheckboxColumn("運転可"),
+                                "default_shift": st.column_config.SelectboxColumn(
+                                    "標準勤務", options=list(SHIFT_PRESETS.keys())),
+                                "custom_start":  st.column_config.TextColumn("カスタム開始 HH:MM"),
+                                "custom_end":    st.column_config.TextColumn("カスタム終了 HH:MM"),
+                            })
         if st.button("💾 スタッフを保存", type="primary", key="ss"):
             save_staff(館, es.to_dict("records")); st.success("✅ 保存しました")
 
 
-# ════ ページ: カラー設定 ═══════════════════════════════
+# ════ ページ: カラー設定 ═══════════════════════════════════
 def page_colors(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
@@ -729,10 +873,8 @@ def page_colors(館):
 
     st.header(f"🎨 カラー設定 — {館}")
     st.caption("送迎表Excelの各セルの色を自由に設定できます。")
-
     colors = load_colors(館)
     updated = dict(colors)
-
     for group_name, keys in COLOR_GROUPS.items():
         st.subheader(group_name)
         cols = st.columns(len(keys))
@@ -741,7 +883,6 @@ def page_colors(館):
             val = colors.get(key, "#FFFFFF")
             picked = cols[i].color_picker(label, value=val, key=f"cp_{key}")
             updated[key] = picked
-
     st.divider()
     col1, col2 = st.columns(2)
     with col1:
@@ -750,10 +891,7 @@ def page_colors(館):
             st.success("✅ カラー設定を保存しました。次回のExcel出力から反映されます。")
     with col2:
         if st.button("🔄 デフォルトに戻す", use_container_width=True):
-            reset_colors(館)
-            st.success("✅ デフォルト色に戻しました。")
-            st.rerun()
-
+            reset_colors(館); st.success("✅ デフォルト色に戻しました。"); st.rerun()
     st.divider()
     st.subheader("プレビュー")
     st.caption("現在の色設定のイメージ")
@@ -784,8 +922,24 @@ if "routes" not in st.session_state:
 # ════ サイドバー ══════════════════════════════════════════════
 with st.sidebar:
     st.title("🚐 送迎表ツール")
-    st.caption("v0.7")
-    館 = st.selectbox("事業所", ["Ⅰ番館","Ⅱ番館","Ⅲ番館","Ⅴ番館"], key="館")
+    st.caption("v0.8")
+
+    # デフォルト事業所（URLパラメータ ?kan=Ⅱ番館 から読み込み）
+    try:
+        url_kan = st.query_params.get("kan", "")
+    except Exception:
+        url_kan = ""
+    def_hall_idx = HALLS.index(url_kan) if url_kan in HALLS else 0
+    館 = st.selectbox("事業所", HALLS, index=def_hall_idx, key="館")
+
+    if st.button("🔗 この事業所をデフォルトに設定", use_container_width=True,
+                 help="クリック後、このページをブックマークしてください"):
+        try:
+            st.query_params["kan"] = 館
+        except Exception:
+            pass
+        st.success(f"URLを ?kan={館} に設定しました。ブックマークしてください。")
+
     st.divider()
 
     # データ保存状態
