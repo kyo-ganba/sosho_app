@@ -620,7 +620,7 @@ APIキーなしでも住所を手動入力して保存できます。
             # 住所マップ（施設名 → 住所）をロード
             addr_map = load_json_data(館, "address_map", default={})
 
-            st.write(f"送迎先施設: {len(facilities)}件**")
+            st.write(f"**送迎先施設: {len(facilities)}件**")
             changed = False
             for facility in facilities:
                 existing = addr_map.get(facility, "")
@@ -792,7 +792,7 @@ with st.sidebar:
     if is_gsheet_configured():
         st.success("☁️ Supabase連携 ON", icon="✅")
     else:
-    　　st.warning("💾 ローカル保存（要設定）", icon="⚠️")
+        st.warning("💾 ローカル保存（要設定）", icon="⚠️")
         with st.expander("Supabase設定方法"):
             st.markdown("""
 1. [supabase.com](https://supabase.com) でプロジェクトを作成
