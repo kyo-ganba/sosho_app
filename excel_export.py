@@ -53,14 +53,16 @@ def export_schedule(
         f"午前_{target_date.month}月{target_date.day}日({wday})")
     _build_sheet(wb, ws_am, vehicles, all_trips, "午前（〜12:59）",
                  target_date, wday, 館, note_map, kubun_map, fmt, colors,
-                 time_filter=lambda t: t < AM_BORDER)
+                 time_filter=lambda t: t < AM_BORDER,
+                 jiriki_users=jiriki_users or [])
 
     # 午後シート
     ws_pm = wb.add_worksheet(
         f"午後_{target_date.month}月{target_date.day}日({wday})")
     _build_sheet(wb, ws_pm, vehicles, all_trips, "午後・送り（13:00〜）",
                  target_date, wday, 館, note_map, kubun_map, fmt, colors,
-                 time_filter=lambda t: t >= AM_BORDER)
+                 time_filter=lambda t: t >= AM_BORDER,
+                 jiriki_users=jiriki_users or [])
 
     wb.close()
     buf.seek(0)
@@ -108,7 +110,7 @@ def _count_childseats(trip_map, kubun_map):
 # ── シート生成 ──────────────────────────────────────────────
 def _build_sheet(wb, ws, vehicles, all_trips, period_label,
                  target_date, wday, 館, note_map, kubun_map, fmt, colors,
-                 time_filter):
+                 time_filter, jiriki_users=None):
     n_v = len(vehicles)
     total_cols = 1 + n_v * COLS_PER_V
 
@@ -224,6 +226,36 @@ def _build_sheet(wb, ws, vehicles, all_trips, period_label,
                                  fmt["arrow"])
             current_row += 1
 
+
+    # ── 自力通所セクション ─────────────────────────────────
+    if jiriki_users:
+        current_row += 1
+        ws.set_row(current_row, 16)
+        ws.merge_range(current_row, 0, current_row, total_cols - 1,
+                       "🚶 自力通所", fmt["jiriki_hdr"])
+        current_row += 1
+        ws.set_row(current_row, 13)
+        ws.write(current_row, 0, "氏名",     fmt["sub_hdr"])
+        ws.write(current_row, 1, "区分",     fmt["sub_hdr"])
+        ws.write(current_row, 2, "登所時刻", fmt["sub_hdr"])
+        ws.write(current_row, 3, "退所時刻", fmt["sub_hdr"])
+        if total_cols > 4:
+            ws.write(current_row, 4, "備考", fmt["sub_hdr"])
+            for c in range(5, total_cols):
+                ws.write(current_row, c, "", fmt["sub_hdr"])
+        current_row += 1
+        for u in jiriki_users:
+            ws.set_row(current_row, 16)
+            ws.write(current_row, 0, u.get("name", ""),   fmt["jiriki_name"])
+            ws.write(current_row, 1, u.get("kubun", ""),  fmt["jiriki_cell"])
+            ws.write(current_row, 2, u.get("arrive", ""), fmt["jiriki_time"])
+            ws.write(current_row, 3, u.get("depart", ""), fmt["jiriki_time"])
+            if total_cols > 4:
+                ws.write(current_row, 4, u.get("note", ""), fmt["jiriki_cell"])
+                for c in range(5, total_cols):
+                    ws.write(current_row, c, "", fmt["jiriki_cell"])
+            current_row += 1
+
     # 印刷設定
     ws.set_landscape()
     ws.set_paper(9)
@@ -314,6 +346,11 @@ def _make_formats(wb, colors):
         "cs_empty": f("#F5F5F5", "#DDDDDD", size=9),
         # はしご矢印
         "arrow":    f(c["はしご矢印"], "#9E9D24", size=9, italic=True),
+        # 自力通所
+        "jiriki_hdr":  f("#37474F", "#FFFFFF", bold=True, size=10),
+        "jiriki_name": f("#ECEFF1", "#212121", size=10, align="left"),
+        "jiriki_cell": f("#ECEFF1", "#212121", size=9),
+        "jiriki_time": f("#CFD8DC", "#37474F", bold=True, size=10),
     }
 
 
