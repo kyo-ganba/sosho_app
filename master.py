@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -12,14 +13,14 @@ MASTER_COLUMNS = [
     "迎え先（平日）", "迎え先（長期休み）",
     "迎え時刻（平日）", "迎え時刻（長期休み）",
     "送り先", "送り時刻",
-    "利用曜日", "住所",
+    "利用曜日", "通所区分", "住所",
     "迎え先住所", "送り先住所",
     "契約上限", "契約月",
     "利用開始日", "利用終了日", "状態",
     "特記事項", "備考",
 ]
 
-HALLS = ["Ⅰ番館", "Ⅱ番館", "Ⅲ番館", "Ⅴ番館"]
+HALLS     = ["Ⅰ番館", "Ⅱ番館", "Ⅲ番館", "Ⅴ番館"]
 DAY_COLS  = ["月_固定", "火_固定", "水_固定", "木_固定", "金_固定", "土_固定"]
 DAY_NAMES = ["月", "火", "水", "木", "金", "土"]
 
@@ -29,7 +30,7 @@ def load_master(館: str) -> pd.DataFrame:
     if p.exists():
         df = pd.read_csv(p, encoding="utf-8-sig", dtype=str).fillna("")
         rename = {
-            "迎え先": "迎え先（平日）",
+            "迎え先":   "迎え先（平日）",
             "下校時刻": "迎え時刻（平日）",
             "自宅時刻": "送り時刻",
         }
@@ -118,11 +119,22 @@ def is_temp_juki_no(v: str) -> bool:
     return False
 
 
+def _extract_district(address: str) -> str:
+    if not address:
+        return ""
+    m = re.search(r"[市区町村郡](.+?)(?:[0-9０-９\-ー－]|$)", address)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"([一-龥ぁ-んァ-ン]+)(?=[0-9０-９])", address)
+    return m.group(1) if m else ""
+
+
 def import_from_internal_csv(raw_df: pd.DataFrame) -> dict:
     df = raw_df.copy().fillna("").astype(str)
     for col in DAY_COLS:
         if col in df.columns:
             df[col] = df[col].str.strip().apply(normalize_hall)
+
     results = {}
     for hall in HALLS:
         mask = pd.Series(False, index=df.index)
@@ -132,45 +144,55 @@ def import_from_internal_csv(raw_df: pd.DataFrame) -> dict:
         if not mask.any():
             results[hall] = pd.DataFrame(columns=MASTER_COLUMNS)
             continue
+
         filtered = df[mask].copy()
+
         def _weekdays(row, _h=hall):
             return "".join(
                 d for d, c in zip(DAY_NAMES, DAY_COLS)
                 if c in row.index and row[c] == _h
             )
+
         def _get(col_name):
             if col_name in filtered.columns:
                 return filtered[col_name]
             return pd.Series("", index=filtered.index)
+
         out = pd.DataFrame(index=filtered.index)
-        out["受給者証番号"] = _get("受給者証番号").str.strip()
-        out["氏名"] = _get("氏名")
-        out["フリガナ"] = _get("カナ")
-        out["区分"] = _get("区分").apply(normalize_kubun)
-        out["地区"] = ""
-        out["医ケア"] = _get("医ケア")
-        out["重心"] = _get("重心")
-        out["迎え先（平日）"] = _get("迎え").apply(normalize_place)
-        out["迎え先（長期休み）"] = out["迎え先（平日）"]
-        out["迎え時刻（平日）"] = ""
+        out["受給者証番号"]         = _get("受給者証番号").str.strip()
+        out["氏名"]                 = _get("氏名")
+        out["フリガナ"]             = _get("カナ")
+        out["区分"]                 = _get("区分").apply(normalize_kubun)
+        out["地区"]                 = ""
+        out["医ケア"]               = _get("医ケア")
+        out["重心"]                 = _get("重心")
+        out["迎え先（平日）"]       = _get("迎え").apply(normalize_place)
+        out["迎え先（長期休み）"]   = out["迎え先（平日）"]
+        out["迎え時刻（平日）"]     = ""
         out["迎え時刻（長期休み）"] = ""
-        out["送り先"] = _get("送り").apply(normalize_place)
-        out["送り時刻"] = ""
-        out["利用曜日"] = filtered.apply(_weekdays, axis=1)
-        out["住所"] = ""
-        out["迎え先住所"] = ""
-        out["送り先住所"] = ""
-        out["契約上限"] = _get("契約上限")
-        out["契約月"] = _get("契約月")
-        out["利用開始日"] = _get("利用開始日")
-        out["利用終了日"] = _get("利用終了日")
-        out["状態"] = _get("状態")
-        out["特記事項"] = ""
-        out["備考"] = _get("備考")
+        out["送り先"]               = _get("送り").apply(normalize_place)
+        out["送り時刻"]             = ""
+        out["利用曜日"]             = filtered.apply(_weekdays, axis=1)
+        out["通所区分"]             = _get("通所区分")
+        out["住所"]                 = ""
+        out["迎え先住所"]           = ""
+        out["送り先住所"]           = ""
+        out["契約上限"]             = _get("契約上限")
+        out["契約月"]               = _get("契約月")
+        out["利用開始日"]           = _get("利用開始日")
+        out["利用終了日"]           = _get("利用終了日")
+        out["状態"]                 = _get("状態")
+        out["特記事項"]             = ""
+        out["備考"]                 = _get("備考")
+
         for col in MASTER_COLUMNS:
             if col not in out.columns:
                 out[col] = ""
-        results[hall] = out[MASTER_COLUMNS].fillna("").replace("None", "").reset_index(drop=True)
+
+        results[hall] = (
+            out[MASTER_COLUMNS].fillna("").replace("None", "").reset_index(drop=True)
+        )
+
     return results
 
 
@@ -214,6 +236,7 @@ def import_from_ritalico(raw_df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
             result[app_col] = raw_df[csv_col].fillna("").astype(str)
         else:
             result[app_col] = ""
+
     if result.get("住所", pd.Series([""] * len(raw_df))).eq("").all():
         parts = []
         for c in ("都道府県", "市区町村", "番地", "ビル・マンション名"):
@@ -221,110 +244,73 @@ def import_from_ritalico(raw_df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
                 parts.append(raw_df[c].fillna("").astype(str))
         if parts:
             result["住所"] = pd.concat(parts, axis=1).apply(
-                lambda r: "".join(v for v in r if v and v != "None"), axis=1)
+                lambda r: "".join(v for v in r if v and v not in ("None", "nan")), axis=1)
+
     if "住所" in result.columns:
         result["地区"] = result["住所"].apply(_extract_district)
-    if "迎え先" in result.columns:
-        result["迎え先（平日）"] = result.pop("迎え先")
+    if "迎え先" in result.columns and "迎え先（平日）" not in result.columns:
+        result.rename(columns={"迎え先": "迎え先（平日）"}, inplace=True)
+
     for col in MASTER_COLUMNS:
         if col not in result.columns:
             result[col] = ""
     return result[MASTER_COLUMNS].fillna("").replace("None", "")
 
 
-def _extract_district(address: str) -> str:
-    if not address:
-        return ""
-    import re
-    m = re.search(r"[市区町村郡](.+?)(?:[0-9０-９\-ー－]|$)", address)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"([一-龥ぁ-んァ-ン]+)(?=[0-9０-９])", address)
-    return m.group(1) if m else ""
-"""
-利用者マスタ管理 — CRUD・変更履歴・リタリコCSV取込
-storage.py 経由で Google Sheets / ローカルCSV に二重保存する。
-"""
-import re
-import pandas as pd
+def import_address_from_hogosha_csv(hogosha_df: pd.DataFrame,
+                                    master_df: pd.DataFrame) -> tuple:
+    """
+    保護者一覧CSVから自宅住所を取込み、master_df の「住所」列を更新する。
+    児童列が「青木 佑都、青木 佑愛」のように複数名を含む場合も対応。
+    Returns: (updated_master_df, matched_count, unmatched_names)
+    """
+    hdf = hogosha_df.copy().fillna("")
 
-from storage import (
-    load_df, save_df, save_history,
-    load_history_list,
-    load_history_df,
-)
+    def _build_addr(row):
+        parts = [
+            str(row.get("都道府県", "") or "").strip(),
+            str(row.get("市区町村", "") or "").strip(),
+            str(row.get("番地",     "") or "").strip(),
+        ]
+        bld = str(row.get("ビル・マンション名", "") or "").strip()
+        if bld and bld.lower() not in ("nan", "none", ""):
+            parts.append(bld)
+        return "".join(p for p in parts if p)
 
-MASTER_COLUMNS = [
-    "氏名", "フリガナ", "区分", "地区",
-    "迎え先（平日", "迎え先（長期休み）",
-    "迎え時刻（平日", "迎え時刻（長期休み）",
-    "送り先", "送り時刻",
-    "利用曜日", "住所", "特記事項", "備考"
-]
+    name_to_addr: dict = {}
+    for _, hrow in hdf.iterrows():
+        addr = _build_addr(hrow)
+        if not addr:
+            continue
+        child_raw = str(hrow.get("児童", "") or "").strip()
+        child_raw = re.sub(r"[,，・]", "、", child_raw)
+        for cn in child_raw.split("、"):
+            cn = cn.strip()
+            if cn:
+                name_to_addr[cn] = addr
 
+    def _normalize(s: str) -> str:
+        return str(s).strip().replace(" ", "").replace("　", "")
 
-def load_master(館: str) -> pd.DataFrame:
-    df = load_df(館, "master", columns=MASTER_COLUMNS)
-    if df.empty:
-        return df
-    rename_map = {
-        "迎え先":   "迎え先（平日",
-        "下校時刻": "迎え時刻（平日）",
-        "自宅時刻": "送り時刻",
-    }
-    for old, new in rename_map.items():
-        if old in df.columns and new not in df.columns:
-            df.rename(columns={old: new}, inplace=True)
-    for col in MASTER_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    return df[MASTER_COLUMNS]
+    lookup = {_normalize(k): v for k, v in name_to_addr.items()}
 
+    updated = master_df.copy()
+    if "住所" not in updated.columns:
+        updated["住所"] = ""
 
-def save_master(館: str, df: pd.DataFrame):
-    for col in MASTER_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    clean = df[MASTER_COLUMNS].copy()
-    save_df(館, "master", clean)
-    save_history(館, clean)
-
-
-def load_history(館: str, timestamp: str) -> pd.DataFrame:
-    return load_history_df(館, timestamp)
-
-
-def import_from_ritalico(raw_df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    result = pd.DataFrame(index=range(len(raw_df)))
-    for app_col, csv_col in mapping.items():
-        if csv_col and csv_col != "（未選択）" and csv_col in raw_df.columns:
-            result[app_col] = raw_df[csv_col].fillna("").astype(str)
+    matched = 0
+    unmatched_names = []
+    for idx, row in updated.iterrows():
+        key = _normalize(str(row.get("氏名", "")))
+        if key and key in lookup:
+            updated.at[idx, "住所"] = lookup[key]
+            district = _extract_district(lookup[key])
+            if district and "地区" in updated.columns:
+                if not str(updated.at[idx, "地区"]).strip():
+                    updated.at[idx, "地区"] = district
+            matched += 1
         else:
-            result[app_col] = ""
-    if result.get("住所", pd.Series([""]*len(raw_df))).eq("").all():
-        parts = []
-        for c in ["都道府県","市区町村","番地","ビル・マンション名"]:
-            if c in raw_df.columns:
-                parts.append(raw_df[c].fillna("").astype(str))
-        if parts:
-            result["住所"] = pd.concat(parts, axis=1).apply(
-                lambda r: "".join(v for v in r if v and v != "None"), axis=1)
-    if "住所" in result.columns:
-        result["地区"] = result["住所"].apply(_extract_district)
-    if "迎え先" in result.columns and "迎え先（平日）" not in result.columns:
-        result.rename(columns={"迎え先":"迎え先（平日）"}, inplace=True)
-    for col in MASTER_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    return result[MASTER_COLUMNS].fillna("").replace("None","")
+            if key:
+                unmatched_names.append(str(row.get("氏名", "")))
 
-
-def _extract_district(address: str) -> str:
-    import re
-    if not address:
-        return ""
-    m = re.search(r"[市区町村郡](.+?)(?:[0-9０-９\-ー－]|$)", address)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"([一-龥ぁ-んァ-ン]+)(?=[0-9０-９])", address)
-    return m.group(1) if m else ""
+    return updated, matched, unmatched_names
