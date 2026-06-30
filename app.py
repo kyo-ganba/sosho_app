@@ -504,7 +504,7 @@ def page_master(館):
                 key="merge_mode",
             )
 
-            if st.button("📥 取込・保存", type="primary"):ry"):
+            if st.button("📥 取込・保存", type="primary"):
                 targets = [館] if "現在" in import_target else ["Ⅰ番館", "Ⅱ番館", "Ⅲ番館", "Ⅴ番館"]
                 saved_total = 0
                 for h in targets:
@@ -625,7 +625,7 @@ APIキーなしでも住所を手動入力して保存できます。
             for facility in facilities:
                 existing = addr_map.get(facility, "")
                 row_a, row_b, row_c = st.columns([2, 3, 1])
-                row_a.write(f"<{facility}>")
+                row_a.write(f"**{facility}**")
 
                 new_addr = row_b.text_input(
                     "住所", value=existing,
