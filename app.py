@@ -1,12 +1,12 @@
 """
 送迎表作成ツール v0.7
 - 運転者を便・車両ごとに手動設定できるUI
-- Google Sheets永続化（storage.py経由）
+- Supabase永続化（storage.py経由）
 - データ保存状態をサイドバーに表示
 """
 import streamlit as st
 import pandas as pd
-import json
+import jsonh
 from pathlib import Path
 from datetime import datetime, time, date
 
@@ -278,7 +278,7 @@ def page_master(館):
 
     st.header(f"👥 利用者マスタ管理 — {館}")
     if is_gsheet_configured():
-        st.info("☁️ Google Sheetsに自動バックアップされています", icon="✅")
+        st.info("☁️ Supabaseに自動バックアップされています", icon="✅")
 
     tab_edit, tab_import, tab_hist = st.tabs(["✏️ 手動編集", "📂 リタリコCSV取込", "🕐 変更履歴"])
 
@@ -487,15 +487,27 @@ with st.sidebar:
 
     # データ保存状態
     if is_gsheet_configured():
-        st.success("☁️ Google Sheets連携 ON", icon="✅")
+        st.success("☁️ Supabase連携 ON", icon="✅")
     else:
         st.warning("💾 ローカル保存（要設定）", icon="⚠️")
-        with st.expander("Google Sheets設定方法"):
+        with st.expander("Supabase設定方法"):
             st.markdown("""
-1. Google Cloud Console でサービスアカウントを作成
-2. Google Sheets API を有効化
-3. スプレッドシートを作成してサービスアカウントと共有
-4. Streamlit Cloud → App設定 → Secrets に認証情報を追加
+1. [supabase.com](https://supabase.com) でプロジェクトを作成
+2. SQL Editorで以下を実行:
+```sql
+CREATE TABLE app_data (
+  key TEXT PRIMARY KEY,
+    data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now()
+      );
+      ```
+      3. Settings → API → `Project URL` と `anon/public key` をコピー
+      4. Streamlit Cloud → App設定 → Secrets に追加:
+      ```toml
+      [supabase]
+      url = "https://xxxx.supabase.co"
+      key = "eyJ..."
+      ```
             """)
 
     st.divider()
