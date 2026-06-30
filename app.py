@@ -14,6 +14,10 @@ import json
 from pathlib import Path
 from datetime import datetime, time, date
 
+# set_page_config must be the first Streamlit call
+# (before any module that uses @st.cache_resource at import time)
+st.set_page_config(page_title="送迎表ツール", page_icon="🚐", layout="wide")
+
 from color_config import (load_colors, save_colors, reset_colors,
                           COLOR_LABELS, COLOR_GROUPS, DEFAULT_COLORS)
 from master import (load_master, save_master, import_from_ritalico,
@@ -24,8 +28,6 @@ from master import (load_master, save_master, import_from_ritalico,
 from routing import generate_routes
 from excel_export import export_schedule
 from storage import load_json_data, save_json_data, is_gsheet_configured
-
-st.set_page_config(page_title="送迎表ツール", page_icon="🚐", layout="wide")
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -77,19 +79,22 @@ def _check_auth() -> bool:
     if not valid_pws:
         valid_pws = ["sosho2024"]   # ← Streamlit Secrets で必ず上書きしてください
 
-    st.title("🚐 送迎表ツール")
-    st.markdown("### キッズフロンティア 社内専用システム")
-    st.divider()
-    st.markdown("**🔐 スタッフ認証**")
-    pw = st.text_input("パスワードを入力してください", type="password", key="login_pw",
-                       placeholder="パスワード")
-    if st.button("ログイン →", type="primary", use_container_width=False):
-        if pw in valid_pws:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("❌ パスワードが違います。もう一度入力してください。")
-    st.caption("🔑 パスワードが分からない場合は管理者にお問い合わせください。")
+    st.markdown("---")
+    col_c, col_f = st.columns([1, 2])
+    with col_f:
+        st.title("🚐 送迎表ツール")
+        st.markdown("### キッズフロンティア 社内専用システム")
+        st.markdown("---")
+        st.markdown("**🔐 スタッフ認証**")
+        pw = st.text_input("パスワードを入力してください", type="password", key="login_pw",
+                           placeholder="パスワード")
+        if st.button("ログイン →", type="primary", use_container_width=True):
+            if pw in valid_pws:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("❌ パスワードが違います。もう一度入力してください。")
+        st.caption("🔑 パスワードが分からない場合は管理者にお問い合わせください。")
     return False
 
 
