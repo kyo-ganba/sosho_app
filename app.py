@@ -13,6 +13,8 @@ from datetime import datetime, time, date
 from color_config import (load_colors, save_colors, reset_colors,
                           COLOR_LABELS, COLOR_GROUPS, DEFAULT_COLORS)
 from master import (load_master, save_master, import_from_ritalico,
+                    import_from_internal_csv, is_temp_juki_no,
+                    get_facilities_needing_address, lookup_address_google,
                     load_history_list, load_history, MASTER_COLUMNS)
 from routing import generate_routes
 from excel_export import export_schedule
@@ -261,14 +263,13 @@ def _trip_editor(trips, vehicle, trip_type, drivers=None):
                         "place":place,"driver":driver})
     return edited
 
-
 # ════ ページ: 利用者マスタ ════════════════════════════════════
 def page_master(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
 **【利用者の追加】**「手動編集」タブ → 表の一番下の行に入力 →「保存」ボタン
-**【利用者の削除】**「手動編集」タブ → 削除したい行の左端のチェックボックスを選択 → ゴミ箱アイコン →「保存」ボタン
-**【一括取込】**「リタリコCSV取込」タブ → CSVをアップロード → 列マッピングを確認 →「取込・保存」
+**【CSV一括取込】**「内部CSV取込」タブ → 利用者一覧CSVをアップロード → 番館別に自動振り分け
+**【住所検索】**「住所検索」タブ → 施設名からGoogle Mapsで住所を自動取得
 **【変更履歴】**「変更履歴」タブ → 過去の状態に戻すことができます
 
 ⚠️ **迎え先（平日）**: 通常の下校先（学校名など）
@@ -280,46 +281,168 @@ def page_master(館):
     if is_gsheet_configured():
         st.info("☁️ Supabaseに自動バックアップされています", icon="✅")
 
-    tab_edit, tab_import, tab_hist = st.tabs(["✏️ 手動編集", "📂 リタリコCSV取込", "🕐 変更履歴"])
+    tab_edit, tab_csv, tab_ritalico, tab_addr, tab_hist = st.tabs([
+        "✏️ 手動編集", "📋 内部CSV取込", "📂 リタリコCSV", "🗺️ 住所検索", "🕐 変更履歴",
+    ])
 
+    # ── 手動編集 ──────────────────────────────────────────────
     with tab_edit:
         master_df = load_master(館)
         if master_df.empty:
             master_df = pd.DataFrame(columns=MASTER_COLUMNS)
 
         st.caption(f"登録人数: {len(master_df)}名")
-        st.info("💡 利用曜日は「月水金」のように漢字1文字で続けて入力してください。当日入力画面でその曜日の利用者に自動チェックが入ります。")
+
+        # 医ケア・重心バッジ
+        if "医ケア" in master_df.columns:
+            ika = master_df[master_df["医ケア"].str.strip().ne("")]
+            if len(ika) > 0:
+                st.warning(f"⚕️ 医療的ケア対象: {len(ika)}名", icon="⚕️")
+
+        st.info("💡 利用曜日は「月水金」のように漢字1文字で続けて入力してください。")
 
         edited = st.data_editor(
             master_df, num_rows="dynamic", use_container_width=True,
             column_config={
-                "区分": st.column_config.SelectboxColumn(
-                    "区分", options=["放デイ","児発"], required=False),
+                "受給者証番号":        st.column_config.TextColumn("受給者証番号"),
+                "区分":               st.column_config.SelectboxColumn(
+                                         "区分", options=["放デイ", "児発"]),
+                "医ケア":             st.column_config.SelectboxColumn(
+                                         "医ケア", options=["", "医ケア1", "医ケア2", "医ケア3"]),
+                "重心":               st.column_config.TextColumn("重心"),
                 "迎え時刻（平日）":    st.column_config.TextColumn("迎え時刻(平日) HH:MM"),
                 "迎え時刻（長期休み）": st.column_config.TextColumn("迎え時刻(長休) HH:MM"),
                 "送り時刻":            st.column_config.TextColumn("送り時刻 HH:MM"),
                 "利用曜日":            st.column_config.TextColumn("利用曜日(例:月水金)"),
-                "特記事項":           st.column_config.TextColumn("特記事項（連絡先・引き渡しルールなど）"),
+                "契約上限":            st.column_config.NumberColumn("契約上限", min_value=0),
+                "契約月":              st.column_config.NumberColumn("契約月", min_value=0),
+                "特記事項":            st.column_config.TextColumn("特記事項"),
                 "備考":               st.column_config.TextColumn("備考"),
             },
             hide_index=False,
         )
 
-        col1, col2 = st.columns([1,3])
-        with col1:
-            if st.button("💾 保存", type="primary", use_container_width=True):
-                save_master(館, edited)
-                st.success(f"✅ {len(edited)}件を保存しました")
+        if st.button("💾 保存", type="primary", use_container_width=False):
+            save_master(館, edited)
+            st.success(f"✅ {len(edited)}件を保存しました")
+            st.rerun()
+
+    # ── 内部CSV取込 ───────────────────────────────────────────
+    with tab_csv:
+        st.subheader("内部利用者一覧CSV を取込")
+        st.info("""
+- 受給者証番号を主キーとして管理します
+- 曜日列の `2` は自動的に `Ⅱ番館` に変換されます
+- 各番館ごとに利用曜日が自動設定されます
+- 児発 / 放デイ を自動識別します
+- 受給者証番号が仮番号（99・申請中など）は⚠️で表示します
+        """)
+
+        uploaded_csv = st.file_uploader("利用者一覧CSVを選択", type=["csv"], key="internal_csv")
+        if uploaded_csv:
+            raw_bytes = uploaded_csv.read()
+            raw_df = None
+            for enc in ("utf-8-sig", "shift-jis", "cp932", "utf-8"):
+                try:
+                    import io as _io
+                    raw_df = pd.read_csv(_io.BytesIO(raw_bytes), encoding=enc, dtype=str)
+                    st.caption(f"文字コード: {enc} で読込成功")
+                    break
+                except Exception:
+                    continue
+            if raw_df is None:
+                st.error("文字コードを判定できませんでした。")
+                st.stop()
+
+            st.write(f"**読込件数: {len(raw_df)}名**")
+            st.dataframe(raw_df.head(5), use_container_width=True)
+
+            # 番館別振り分けプレビュー
+            hall_dfs = import_from_internal_csv(raw_df)
+            st.subheader("番館別 振り分けプレビュー")
+            cols4 = st.columns(4)
+            for i, h in enumerate(["Ⅰ番館", "Ⅱ番館", "Ⅲ番館", "Ⅴ番館"]):
+                cols4[i].metric(h, f"{len(hall_dfs.get(h, []))}名")
+
+            # 仮番号警告
+            all_rows = pd.concat(
+                [d for d in hall_dfs.values() if not d.empty], ignore_index=True
+            )
+            if not all_rows.empty and "受給者証番号" in all_rows.columns:
+                all_unique = all_rows.drop_duplicates("受給者証番号")
+                temp_mask = all_unique["受給者証番号"].apply(is_temp_juki_no)
+                temp_users = all_unique[temp_mask]
+                if len(temp_users):
+                    with st.expander(f"⚠️ 受給者証番号が未確定: {len(temp_users)}名"):
+                        st.dataframe(
+                            temp_users[["氏名", "受給者証番号", "状態", "備考"]],
+                            use_container_width=True,
+                        )
+
+            # 現番館プレビュー
+            df_cur = hall_dfs.get(館, pd.DataFrame())
+            if not df_cur.empty:
+                st.subheader(f"{館} の取込データ（{len(df_cur)}名）")
+                preview_cols = ["氏名", "区分", "利用曜日", "迎え先（平日）",
+                                "送り先", "医ケア", "受給者証番号"]
+                st.dataframe(df_cur[[c for c in preview_cols if c in df_cur.columns]],
+                             use_container_width=True)
+
+            st.divider()
+            c_left, c_right = st.columns(2)
+            import_target = c_left.radio(
+                "取込対象",
+                [f"現在の番館のみ（{館}）", "全番館（Ⅰ〜Ⅴ）"],
+                key="import_target",
+            )
+            merge_mode = c_right.radio(
+                "既存データとの統合",
+                ["上書き（全件置換）", "追加・更新（受給者証番号で照合）"],
+                key="merge_mode",
+            )
+
+            if st.button("📥 取込・保存", type="primary"):
+                targets = [館] if "現在" in import_target else ["Ⅰ番館", "Ⅱ番館", "Ⅲ番館", "Ⅴ番館"]
+                saved_total = 0
+                for h in targets:
+                    new_df = hall_dfs.get(h, pd.DataFrame())
+                    if new_df.empty:
+                        continue
+                    if "追加・更新" in merge_mode:
+                        existing = load_master(h)
+                        if (not existing.empty and "受給者証番号" in existing.columns):
+                            existing_ids = set(existing["受給者証番号"].str.strip())
+                            # 既存行を更新
+                            merged = existing.copy()
+                            for _, row in new_df.iterrows():
+                                jid = str(row.get("受給者証番号", "")).strip()
+                                idx_list = merged.index[
+                                    merged["受給者証番号"].str.strip() == jid
+                                ].tolist()
+                                if idx_list:
+                                    merged.loc[idx_list[0]] = row
+                                else:
+                                    merged = pd.concat(
+                                        [merged, row.to_frame().T], ignore_index=True
+                                    )
+                            save_master(h, merged)
+                        else:
+                            save_master(h, new_df)
+                    else:
+                        save_master(h, new_df)
+                    saved_total += len(new_df)
+                st.success(f"✅ {saved_total}件を保存しました（{', '.join(targets)}）")
                 st.rerun()
 
-    with tab_import:
+    # ── リタリコCSV ───────────────────────────────────────────
+    with tab_ritalico:
         st.subheader("リタリコCSVをインポート")
         st.info("リタリコから「保護者一覧」などのCSVをエクスポートしてアップロードしてください。")
         uploaded = st.file_uploader("CSVファイルを選択", type=["csv"], key="ritalico_csv")
         if uploaded:
             raw_bytes = uploaded.read()
             raw_df = None
-            for enc in ["utf-8-sig","shift-jis","cp932","utf-8"]:
+            for enc in ("utf-8-sig", "shift-jis", "cp932", "utf-8"):
                 try:
                     import io as _io
                     raw_df = pd.read_csv(_io.BytesIO(raw_bytes), encoding=enc)
@@ -331,54 +454,130 @@ def page_master(館):
                 st.error("文字コードを判定できませんでした。UTF-8またはShift-JISで保存し直してください。")
                 st.stop()
 
-            st.write("**プレビュー（先頭5行）**")
             st.dataframe(raw_df.head(), use_container_width=True)
-
             cols_csv = ["（未選択）"] + list(raw_df.columns)
+
             def _g(*cands):
                 for c in cands:
-                    if c in raw_df.columns: return c
+                    if c in raw_df.columns:
+                        return c
                 return "（未選択）"
 
             st.subheader("列マッピング")
-            st.caption("「氏名列」と「住所（市区町村・番地など複数列）」を選ぶだけで取込めます。他は後で手動入力できます。")
+            c1, c2 = st.columns(2)
+            col_name  = c1.selectbox("氏名列（必須）", cols_csv,
+                index=cols_csv.index(_g("児童", "氏名", "利用者名", "お子様名")), key="m_name")
+            col_kana  = c2.selectbox("フリガナ列", cols_csv,
+                index=cols_csv.index(_g("児童カナ", "フリガナ", "保護者（カナ）")), key="m_kana")
+            col_addr  = st.selectbox("住所列", cols_csv, index=0, key="m_addr")
+            c3, c4, c5 = st.columns(3)
+            col_school = c3.selectbox("迎え先列", cols_csv,
+                index=cols_csv.index(_g("学校名", "通学先", "迎え先")), key="m_school")
+            col_type  = c4.selectbox("区分列", cols_csv,
+                index=cols_csv.index(_g("サービス種別", "区分", "サービス")), key="m_type")
+            col_day   = c5.selectbox("利用曜日列", cols_csv,
+                index=cols_csv.index(_g("利用曜日", "曜日")), key="m_day")
 
-            c1,c2 = st.columns(2)
-            col_name = c1.selectbox("氏名列（必須）", cols_csv,
-                index=cols_csv.index(_g("児童","氏名","利用者名","お子様名")),
-                key="m_name")
-            col_kana = c2.selectbox("フリガナ列", cols_csv,
-                index=cols_csv.index(_g("児童カナ","フリガナ","保護者（カナ）")),
-                key="m_kana")
-
-            col_addr = st.selectbox("住所列（単一列の場合のみ・複数列なら未選択でOK）",
-                cols_csv, index=0, key="m_addr")
-
-            c3,c4,c5 = st.columns(3)
-            col_school = c3.selectbox("学校名/迎え先列", cols_csv,
-                index=cols_csv.index(_g("学校名","学校","通学先","迎え先")), key="m_school")
-            col_type = c4.selectbox("区分列（放デイ/児発）", cols_csv,
-                index=cols_csv.index(_g("サービス種別","区分","サービス")), key="m_type")
-            col_day = c5.selectbox("利用曜日列", cols_csv,
-                index=cols_csv.index(_g("利用曜日","曜日")), key="m_day")
-
-            if st.button("📥 取込・保存", type="primary"):
-                mapping = {"氏名":col_name,"フリガナ":col_kana,"住所":col_addr,
-                           "迎え先（平日）":col_school,"区分":col_type,"利用曜日":col_day}
+            if st.button("📥 取込・保存", type="primary", key="ritalico_save"):
+                mapping = {"氏名": col_name, "フリガナ": col_kana, "住所": col_addr,
+                           "迎え先（平日）": col_school, "区分": col_type, "利用曜日": col_day}
                 result_df = import_from_ritalico(raw_df, mapping)
                 save_master(館, result_df)
-                st.success(f"✅ {len(result_df)}件を取込みました！「手動編集」タブで迎え時刻・区分を追記してください。")
-                st.dataframe(result_df[["氏名","地区","迎え先（平日）","区分","利用曜日"]],
+                st.success(f"✅ {len(result_df)}件を取込みました！")
+                st.dataframe(result_df[["氏名", "地区", "迎え先（平日）", "区分", "利用曜日"]],
                              use_container_width=True)
 
+    # ── 住所検索 ──────────────────────────────────────────────
+    with tab_addr:
+        st.subheader("🗺️ 送迎先 住所検索")
+        master_df = load_master(館)
+        facilities = get_facilities_needing_address(master_df)
+
+        if not facilities:
+            st.info("送迎先の施設がありません。先に利用者マスタを取り込んでください。")
+        else:
+            api_key = ""
+            try:
+                api_key = st.secrets.get("google_maps", {}).get("api_key", "")
+            except Exception:
+                pass
+
+            if not api_key:
+                st.warning("""
+⚠️ Google Maps APIキーが設定されていません。
+
+Streamlit Cloud → Settings → Secrets に以下を追加してください：
+```toml
+[google_maps]
+api_key = "AIza..."
+```
+APIキーなしでも住所を手動入力して保存できます。
+                """)
+
+            # 住所マップ（施設名 → 住所）をロード
+            addr_map = load_json_data(館, "address_map", default={})
+
+            st.write(f"**送迎先施設: {len(facilities)}件**")
+            changed = False
+            for facility in facilities:
+                existing = addr_map.get(facility, "")
+                row_a, row_b, row_c = st.columns([2, 3, 1])
+                row_a.write(f"**{facility}**")
+
+                new_addr = row_b.text_input(
+                    "住所", value=existing,
+                    key=f"addr_{facility}",
+                    label_visibility="collapsed",
+                    placeholder="住所を入力またはGoogle検索",
+                )
+                if new_addr != existing:
+                    addr_map[facility] = new_addr
+                    changed = True
+
+                search_ok = bool(api_key)
+                if row_c.button("🔍 検索", key=f"search_{facility}", disabled=not search_ok):
+                    cands = lookup_address_google(facility, api_key)
+                    if cands:
+                        st.session_state[f"cands_{facility}"] = cands
+                    else:
+                        st.warning(f"「{facility}」の住所が見つかりませんでした")
+
+                # 候補ボタン
+                for cand in st.session_state.get(f"cands_{facility}", [])[:3]:
+                    addr = cand.get("formatted_address", "")
+                    name = cand.get("name", "")
+                    if st.button(f"✅ {name} — {addr}", key=f"pick_{facility}_{addr}"):
+                        addr_map[facility] = addr
+                        # マスタの住所列も更新
+                        updated = load_master(館)
+                        for place_col, addr_col in (
+                            ("迎え先（平日）", "迎え先住所"),
+                            ("迎え先（長期休み）", "迎え先住所"),
+                            ("送り先", "送り先住所"),
+                        ):
+                            if place_col in updated.columns and addr_col in updated.columns:
+                                updated.loc[updated[place_col] == facility, addr_col] = addr
+                        save_master(館, updated)
+                        save_json_data(館, "address_map", addr_map)
+                        del st.session_state[f"cands_{facility}"]
+                        st.success(f"✅ 保存: {addr}")
+                        st.rerun()
+
+            if st.button("💾 住所マップを保存", type="primary"):
+                save_json_data(館, "address_map", addr_map)
+                st.success("✅ 保存しました")
+
+    # ── 変更履歴 ──────────────────────────────────────────────
     with tab_hist:
         st.subheader("変更履歴")
         hist_list = load_history_list(館)
         if not hist_list:
             st.info("まだ変更履歴がありません。保存するたびに自動で記録されます。")
         else:
-            sel = st.selectbox("履歴を選択", hist_list,
-                format_func=lambda x: f"{x[:4]}/{x[4:6]}/{x[6:8]} {x[9:11]}:{x[11:13]}:{x[13:15]}")
+            sel = st.selectbox(
+                "履歴を選択", hist_list,
+                format_func=lambda x: f"{x[:4]}/{x[4:6]}/{x[6:8]} {x[9:11]}:{x[11:13]}:{x[13:15]}",
+            )
             hist_df = load_history(館, sel)
             st.dataframe(hist_df, use_container_width=True)
             if st.button("⏪ この時点に戻す", type="secondary"):
@@ -387,13 +586,14 @@ def page_master(館):
                 st.rerun()
 
 
-# ════ ページ: 車両・スタッフ ═════════════════════════════════
+
+# ════ ページ: 車両・スタッフ ═══════════════════════════════════
 def page_vehicles(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
 **【車両の追加・変更】**「車両」タブ → 表に入力 →「保存」ボタン
 **【スタッフの追加】**「スタッフ」タブ → 氏名・運転可否・勤務時間を入力 →「保存」ボタン
-"��️「運転可」にチェックがあるスタッフのみ、当日入力画面で運転者候補として表示されます
+⚠️「運転可」にチェックがあるスタッフのみ、当日入力画面で運転者候補として表示されます
         """)
 
     st.header(f"🚗 車両・スタッフ設定 — {館}")
@@ -415,12 +615,12 @@ def page_vehicles(館):
             save_staff(館, es.to_dict("records")); st.success("✅ 保存しました")
 
 
-# ════ ページ: カラー設定 ═══════════════════════════════════
+# ════ ページ: カラー設定 ═══════════════════════════════════════
 def page_colors(館):
     with st.expander("📖 使い方ガイド（クリックで開く）", expanded=False):
         st.markdown("""
 **色の変更方法：** 各項目のカラーピッカーで色を選択 →「保存」ボタンを押すと反映されます
-**リシット：**「デフォルトに戻す」ボタンで初期色に戻せます
+**リセット：**「デフォルトに戻す」ボタンで初期色に戻せます
 ⚠️ 設定は館ごとに保存されます
         """)
 
@@ -444,7 +644,7 @@ def page_colors(館):
     with col1:
         if st.button("💾 保存", type="primary", use_container_width=True):
             save_colors(館, updated)
-            st.success("✅ カラー設定を保存しました。次回はExcel出力から反映されます。")
+            st.success("✅ カラー設定を保存しました。次回のExcel出力から反映されます。")
     with col2:
         if st.button("🔄 デフォルトに戻す", use_container_width=True):
             reset_colors(館)
@@ -497,17 +697,17 @@ with st.sidebar:
 ```sql
 CREATE TABLE app_data (
   key TEXT PRIMARY KEY,
-    data JSONB NOT NULL,
-      updated_at TIMESTAMPTZ DEFAULT now()
-      );
-      ```
-      3. Settings → API → `Project URL` と `anon/public key` をコピー
-      4. Streamlit Cloud → App設定 → Secrets に追加:
-      ```toml
-      [supabase]
-      url = "https://xxxx.supabase.co"
-      key = "eyJ..."
-      ```
+  data JSONB NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+```
+3. Settings → API → `Project URL` と `anon/public key` をコピー
+4. Streamlit Cloud → App設定 → Secrets に追加:
+```toml
+[supabase]
+url = "https://xxxx.supabase.co"
+key = "eyJ..."
+```
             """)
 
     st.divider()
