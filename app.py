@@ -79,22 +79,19 @@ def _check_auth() -> bool:
     if not valid_pws:
         valid_pws = ["sosho2024"]   # ← Streamlit Secrets で必ず上書きしてください
 
-    st.markdown("---")
-    col_c, col_f = st.columns([1, 2])
-    with col_f:
-        st.title("🚐 送迎表ツール")
-        st.markdown("### キッズフロンティア 社内専用システム")
-        st.markdown("---")
-        st.markdown("**🔐 スタッフ認証**")
-        pw = st.text_input("パスワードを入力してください", type="password", key="login_pw",
-                           placeholder="パスワード")
-        if st.button("ログイン →", type="primary", use_container_width=True):
-            if pw in valid_pws:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("❌ パスワードが違います。もう一度入力してください。")
-        st.caption("🔑 パスワードが分からない場合は管理者にお問い合わせください。")
+    st.title("🚐 送迎表ツール")
+    st.markdown("### キッズフロンティア 社内専用システム")
+    st.divider()
+    st.markdown("**🔐 スタッフ認証**")
+    pw = st.text_input("パスワードを入力してください", type="password", key="login_pw",
+                       placeholder="パスワード")
+    if st.button("ログイン →", type="primary", use_container_width=False):
+        if pw in valid_pws:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("❌ パスワードが違います。もう一度入力してください。")
+    st.caption("🔑 パスワードが分からない場合は管理者にお問い合わせください。")
     return False
 
 
