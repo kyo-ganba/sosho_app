@@ -802,9 +802,10 @@ def page_master(館):
             # 保存・削除ボタン
             _sc, _dc = st.columns([4, 1])
             if _sc.button("💾 保存する", type="primary", key=f"save_detail_{_ek}", use_container_width=True):
+                _save_df = master_df.copy()
                 for _k, _v in _nv.items():
-                    master_df.at[_orig_idx, _k] = _v
-                save_master(館, master_df)
+                    _save_df.loc[_orig_idx, _k] = _v
+                save_master(館, _save_df)
                 st.success(f"✅ 「{_nv.get('氏名','')}」を保存しました！")
                 st.rerun()
 
