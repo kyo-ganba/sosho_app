@@ -626,11 +626,11 @@ def page_master(館):
 
         # 統計カード
         _n_total  = len(master_df)
-        _n_active = int((master_df.get("状態", pd.Series([""], index=master_df.index))
+        _n_active = int((master_df.get("状態", pd.Series([""] * len(master_df), index=master_df.index))
                          .apply(lambda x: str(x).strip() not in ("退所","終了","inactive"))).sum())
         _n_jiriki = int(master_df.apply(
             lambda r: str(r.get("通所区分","")).strip() in _JIRIKI_VALUES, axis=1).sum())
-        _n_ika    = int((master_df.get("医ケア", pd.Series([""], index=master_df.index))
+        _n_ika    = int((master_df.get("医ケア", pd.Series([""] * len(master_df), index=master_df.index))
                          .apply(lambda x: bool(str(x).strip()))).sum())
         sc1, sc2, sc3, sc4 = st.columns(4)
         sc1.metric("登録人数", f"{_n_total}名")
