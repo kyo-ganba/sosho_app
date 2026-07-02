@@ -650,11 +650,29 @@ def page_master(館):
             if found.empty:
                 st.warning(f"「{sq}」に一致する利用者が見つかりません。")
             else:
-                st.success(f"🔎 {len(found)}名が見つかりました")
-                show_cols = [c for c in ["氏名","フリガナ","区分","通所区分","利用曜日",
-                                          "迎え先（平日）","送り先","住所","状態"] if c in found.columns]
-                st.dataframe(found[show_cols], use_container_width=True, hide_index=True)
-                st.caption("編集は下の一覧から行ってください ↓")
+                st.success(f"🔎 {len(found)}名が見つかりました — そのまま編集して保存できます")
+                found_edited = st.data_editor(
+                    found, num_rows="fixed", use_container_width=True,
+                    key="search_result_editor",
+                    column_config={
+                        "区分":               st.column_config.SelectboxColumn("区分", options=["放デイ","児発"]),
+                        "通所区分":           st.column_config.SelectboxColumn("通所区分", options=["","送迎","自力"]),
+                        "医ケア":             st.column_config.SelectboxColumn("医ケア", options=["","医ケア1","医ケア2","医ケア3"]),
+                        "状態":               st.column_config.SelectboxColumn("状態", options=["","在籍","退所","体験"]),
+                        "迎え時刻（平日）":    st.column_config.TextColumn("迎え時刻(平日) HH:MM"),
+                        "迎え時刻（長期休み）": st.column_config.TextColumn("迎え時刻(長休) HH:MM"),
+                        "送り時刻":            st.column_config.TextColumn("送り時刻 HH:MM"),
+                        "利用曜日":            st.column_config.TextColumn("利用曜日(例:月水金)"),
+                        "契約上限":            st.column_config.NumberColumn("契約上限", min_value=0),
+                        "住所":                st.column_config.TextColumn("住所（自宅）"),
+                    },
+                    hide_index=False,
+                )
+                if st.button("💾 検索結果を保存", key="save_search_result", type="primary"):
+                    master_df.update(found_edited)
+                    save_master(館, master_df)
+                    st.success("✅ 保存しました！")
+                    st.rerun()
             st.divider()
 
         edited = st.data_editor(
