@@ -900,4 +900,144 @@ def page_master(館):
                 st.warning("⚠️ Google Maps APIキーが未設定です（Secrets に [google_maps] api_key を追加してください）")
 
             addr_map = load_json_data(館, "address_map", default={})
-        
+
+            st.caption(f"{len(facilities)}件の送迎先の住所を設定できます")
+            changed = False
+            for fac in facilities:
+                c1, c2, c3 = st.columns([3, 5, 1])
+                c1.markdown(f"**{fac}**")
+                cur = addr_map.get(fac, "")
+                new_val = c2.text_input("住所", value=cur, key=f"addr_{fac}",
+                                        label_visibility="collapsed",
+                                        placeholder="例: 東京都新宿区西新宿1-1-1")
+                if new_val != cur:
+                    addr_map[fac] = new_val
+                    changed = True
+                if api_key:
+                    if c3.button("🔍", key=f"look_{fac}", help="Google Mapsで検索"):
+                        with st.spinner(f"{fac} を検索中…"):
+                            found = lookup_address_google(fac, api_key)
+                        if found:
+                            addr_map[fac] = found
+                            save_json_data(館, "address_map", addr_map)
+                            st.success(f"✅ {fac}: {found}")
+                            st.rerun()
+                        else:
+                            st.warning(f"⚠️ {fac} の住所が見つかりませんでした")
+
+            if st.button("💾 住所マップを保存", type="primary", key="addr_save"):
+                save_json_data(館, "address_map", addr_map)
+                st.success("✅ 住所マップを保存しました")
+
+    # ── 変更履歴 ──────────────────────────────────────────────
+    with tab_hist:
+        st.subheader("🕐 変更履歴")
+        hist_list = load_history_list(館)
+        if not hist_list:
+            st.info("変更履歴がありません。マスタを保存すると履歴が作成されます。")
+        else:
+            sel = st.selectbox("復元する履歴を選択", hist_list, key="hist_sel")
+            if sel:
+                hist_df = load_history(館, sel)
+                st.dataframe(hist_df, use_container_width=True)
+                if st.button("⏪ この履歴に戻す", type="primary", key="hist_restore"):
+                    save_master(館, hist_df)
+                    st.success(f"✅ {sel} の状態に戻しました")
+                    st.rerun()
+
+
+# ════ ページ: 車両・スタッフ・カラー設定 ══════════════════════════
+def page_settings(館):
+    st.header(f"⚙️ 設定 — {館}")
+    tab_v, tab_s, tab_p, tab_c = st.tabs(["🚐 車両", "👤 スタッフ", "📍 カスタム送迎先", "🎨 カラー"])
+
+    with tab_v:
+        vdf = pd.DataFrame(load_vehicles(館))
+        ev = st.data_editor(vdf, num_rows="dynamic", use_container_width=True,
+                            column_config={
+                                "定員": st.column_config.NumberColumn("定員", min_value=1, max_value=20)
+                            }, key="veh_ed")
+        if st.button("💾 車両を保存", type="primary", key="sv_v"):
+            save_vehicles(館, ev.to_dict("records"))
+            st.success("✅ 保存しました")
+
+    with tab_s:
+        raw_s = load_staff(館)
+        sdf = pd.DataFrame(raw_s) if raw_s else pd.DataFrame(columns=["氏名","運転可","備考"])
+        es = st.data_editor(sdf, num_rows="dynamic", use_container_width=True,
+                            column_config={
+                                "運転可": st.column_config.CheckboxColumn("運転可")
+                            }, key="stf_ed")
+        if st.button("💾 スタッフを保存", type="primary", key="sv_s"):
+            save_staff(館, es.to_dict("records"))
+            st.success("✅ 保存しました")
+
+    with tab_p:
+        st.caption("ここで登録した送迎先は「迎え先」「送り先」のプルダウンに表示されます。")
+        raw_p = load_custom_places(館)
+        pdf = pd.DataFrame(raw_p) if raw_p else pd.DataFrame(columns=["送迎先名"])
+        ep = st.data_editor(pdf, num_rows="dynamic", use_container_width=True, key="plc_ed")
+        if st.button("💾 送迎先を保存", type="primary", key="sv_p"):
+            save_custom_places(館, ep.to_dict("records"))
+            st.success("✅ 保存しました")
+
+    with tab_c:
+        st.caption("送迎表Excelの各セルの色を設定できます。")
+        colors = load_colors(館)
+        updated = dict(colors)
+        for group_name, keys in COLOR_GROUPS.items():
+            st.subheader(group_name)
+            cols_c = st.columns(len(keys))
+            for i, key in enumerate(keys):
+                label = COLOR_LABELS.get(key, key)
+                val = colors.get(key, "#FFFFFF")
+                updated[key] = cols_c[i].color_picker(label, value=val, key=f"cp_{key}")
+        st.divider()
+        c1c, c2c = st.columns(2)
+        if c1c.button("💾 保存", type="primary", use_container_width=True, key="col_save"):
+            save_colors(館, updated)
+            st.success("✅ カラー設定を保存しました")
+        if c2c.button("🔄 デフォルトに戻す", use_container_width=True, key="col_reset"):
+            reset_colors(館)
+            st.success("✅ デフォルト色に戻しました")
+            st.rerun()
+
+
+# ════ セッション初期化 ════════════════════════════════════════════
+if "routes" not in st.session_state:
+    st.session_state.routes = None
+
+# ════ 認証 ═══════════════════════════════════════════════════════
+if not _check_auth():
+    st.stop()
+
+# ════ サイドバー ══════════════════════════════════════════════════
+_kan_from_url = st.query_params.get("kan", "Ⅴ番館")
+if _kan_from_url not in HALLS:
+    _kan_from_url = "Ⅴ番館"
+
+with st.sidebar:
+    st.markdown("## 🚐 送迎表ツール")
+    st.caption("v1.0")
+    館 = st.selectbox("事業所", HALLS,
+                      index=HALLS.index(_kan_from_url), key="館_sel")
+    try:
+        st.query_params["kan"] = 館
+    except Exception:
+        pass
+    st.divider()
+    if is_gsheet_configured():
+        st.caption("☁️ Supabase連携中")
+    nav = st.radio("", [
+        "📅 当日入力・送迎表",
+        "👥 利用者マスタ管理",
+        "⚙️ 車両・スタッフ・色設定",
+    ], label_visibility="collapsed", key="nav_sel")
+
+# ════ ルーティング ════════════════════════════════════════════════
+if nav == "📅 当日入力・送迎表":
+    page_daily(館)
+elif nav == "👥 利用者マスタ管理":
+    page_master(館)
+elif nav == "⚙️ 車両・スタッフ・色設定":
+    page_settings(館)
